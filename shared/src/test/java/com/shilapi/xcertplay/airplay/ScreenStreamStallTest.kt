@@ -3,16 +3,17 @@ package com.shilapi.xcertplay.airplay
 import java.net.Socket
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
-import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 
 /**
- * A silent iPhone sender must not freeze the screen forever: the stream
- * reports the stall (so the engine can request a keyframe) and eventually
- * resets itself so the iPhone re-SETUPs a fresh screen stream.
+ * A silent iPhone sender must be reported (so the engine can request a
+ * keyframe) without ending the stream: measured stalls clear on their
+ * own, and closing the screen stream only tears down the whole CarPlay
+ * session because the iPhone does not re-SETUP it.
  */
 @RunWith(RobolectricTestRunner::class)
 class ScreenStreamStallTest {
@@ -37,24 +38,34 @@ class ScreenStreamStallTest {
     }
 
     @Test
-    fun silentStreamReportsStallAndResets() {
+    fun silentStreamReportsStallWithoutEndingTheStream() {
         val listener = RecordingListener()
         val stream = stalledTestStream()
         val port = stream.listen(listener)
         Socket("127.0.0.1", port).use { client ->
             client.outputStream.write(configMessage())
             client.outputStream.flush()
-            assertTrue("stream should end after the reset budget", listener.awaitClosed(5_000))
+            Thread.sleep(1_000)
+            assertTrue("stall report expected", listener.stallReports.isNotEmpty())
+            assertTrue(
+                "stall report should carry the silent duration",
+                listener.stallReports.all { it >= STALL_REPORT_MILLIS },
+            )
+            assertNull("stream must stay open through a receive stall", listener.closedCause)
+            // A payload after the stall resets the stall clock: within
+            // less than the report threshold, no new report may fire
+            // (an unreset clock would report within one report interval).
+            client.outputStream.write(configMessage())
+            client.outputStream.flush()
+            val reportsAtReset = listener.stallReports.size
+            Thread.sleep(150)
+            assertTrue(
+                "stall clock resets after a payload",
+                listener.stallReports.size == reportsAtReset,
+            )
         }
-        assertTrue("stall report expected", listener.stallReports.isNotEmpty())
-        assertTrue(
-            "stall report should carry the silent duration",
-            listener.stallReports.all { it >= STALL_REPORT_MILLIS },
-        )
-        assertTrue(
-            "closed cause should be the receive stall",
-            listener.closedCause is ScreenStream.ReceiveStallError,
-        )
+        // The client EOF ends the stream.
+        assertTrue(listener.awaitClosed(5_000))
         stream.close()
     }
 
@@ -84,7 +95,6 @@ class ScreenStreamStallTest {
             readTimeoutMillis = 100
             stallReportMillis = STALL_REPORT_MILLIS
             stallReportIntervalMillis = 400
-            stallResetMillis = 5_000
         }
         val port = stream.listen(listener)
         Socket("127.0.0.1", port).use { client ->
@@ -107,7 +117,6 @@ class ScreenStreamStallTest {
             readTimeoutMillis = 100
             stallReportMillis = STALL_REPORT_MILLIS
             stallReportIntervalMillis = 100
-            stallResetMillis = 600
         }
 
     private companion object {

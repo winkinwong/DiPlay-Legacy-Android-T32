@@ -155,8 +155,8 @@ class CarPlayMediaEngine(
                 override fun onReceiveStall(millis: Long) {
                     if (streams[streamKey] !== screen) return
                     // A silent sender gets the same keyframe nudge as the
-                    // decoder recovery handler; ScreenStream resets the
-                    // stream itself if the silence outlives its budget.
+                    // decoder recovery handler; the stream itself stays
+                    // open because the iPhone does not re-SETUP it.
                     val command = if (type == STREAM_TYPE_ALT_SCREEN) {
                         mapOf("type" to "forceKeyFrame", "params" to mapOf("uuid" to AirPlayInfoPlist.ALT_UUID))
                     } else {

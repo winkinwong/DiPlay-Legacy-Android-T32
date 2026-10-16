@@ -56,8 +56,6 @@ class ScreenStream(
     internal var stallReportMillis: Long = STALL_REPORT_MILLIS
     /** Test seam: production uses [STALL_REPORT_INTERVAL_MILLIS]. */
     internal var stallReportIntervalMillis: Long = STALL_REPORT_INTERVAL_MILLIS
-    /** Test seam: production uses [STALL_RESET_MILLIS]. */
-    internal var stallResetMillis: Long = STALL_RESET_MILLIS
     /** Receive-thread owned: when the last payload finished arriving. */
     private var lastPayloadNanos = 0L
     /** Receive-thread owned: the last reported stall duration. */
@@ -93,9 +91,9 @@ class ScreenStream(
         val stats = StreamReceiveStats("video", onDiagnostic)
         try {
             // Reads time out so a silent iPhone sender is noticed and
-            // recovered instead of freezing the screen forever; see
-            // onReadTimeout. Partial reads keep their progress across
-            // timeouts, so a slow link is unaffected.
+            // nudged with a keyframe; see onReadTimeout. Partial reads
+            // keep their progress across timeouts, so a slow link is
+            // unaffected.
             sock.soTimeout = readTimeoutMillis
             val input = sock.getInputStream()
             while (!closed.get()) {
@@ -171,10 +169,11 @@ class ScreenStream(
 
     /**
      * A read saw no data for [readTimeoutMillis]. Repeated timeouts
-     * mean the iPhone stopped sending video: ask for a keyframe, and
-     * once the silence outlives the reset budget, end the stream so
-     * the iPhone re-SETUPs a fresh one - a new TCP connection clears
-     * a stalled sender that keeps retransmitting into a black hole.
+     * mean the iPhone stopped sending video: report the stall so the
+     * engine can request a keyframe. The stream itself stays open -
+     * measured stalls up to ~18 s clear on their own, and ending the
+     * screen stream does not make the iPhone re-SETUP; it only tears
+     * down the whole CarPlay session (t32.4 regression).
      */
     private fun onReadTimeout() {
         val now = System.nanoTime()
@@ -185,11 +184,6 @@ class ScreenStream(
             return
         }
         val stalledMillis = (now - lastPayloadNanos) / 1_000_000
-        if (stalledMillis >= stallResetMillis) {
-            Log.w(TAG, "video receive stalled ${stalledMillis}ms; resetting the screen stream")
-            onDiagnostic("video receive stalled ${stalledMillis}ms; resetting the screen stream")
-            throw ReceiveStallError(stalledMillis)
-        }
         if (stalledMillis < stallReportMillis) return
         if (stalledMillis - lastStallReportMillis < stallReportIntervalMillis) return
         lastStallReportMillis = stalledMillis
@@ -197,10 +191,6 @@ class ScreenStream(
         onDiagnostic("video receive stalled ${stalledMillis}ms")
         listener.onReceiveStall(stalledMillis)
     }
-
-    /** Ends the receive loop after a prolonged receive stall. */
-    internal class ReceiveStallError(val stalledMillis: Long) :
-        Exception("receive stalled ${stalledMillis}ms")
 
     private companion object {
         const val TAG = "xcertplay-usb"
@@ -215,8 +205,6 @@ class ScreenStream(
         const val STALL_REPORT_MILLIS = 2_000L
         /** At most one stall report per interval. */
         const val STALL_REPORT_INTERVAL_MILLIS = 1_000L
-        /** Silence that ends the stream so the iPhone re-SETUPs it. */
-        const val STALL_RESET_MILLIS = 10_000L
     }
 }
 
