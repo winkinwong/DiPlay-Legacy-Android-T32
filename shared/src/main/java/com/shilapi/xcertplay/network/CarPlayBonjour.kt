@@ -52,6 +52,28 @@ internal fun <T> bindAvailableMdnsFamilies(
     return bound
 }
 
+/**
+ * Binds mDNS, retrying while every family failed. On Android 4.x a previous instance's JmDNS close
+ * can hold port 5353 for ~2 s after a fast reconnect, so the first bind after a settings change
+ * fails outright. Retrying turns that fatal bring-up failure ("Interface mDNS could not bind on any
+ * advertised address", which cost a full reconnect cycle and ~30 s of black screen) into a ~1 s delay.
+ */
+internal fun <T> bindMdnsWithRetry(
+    maxAttempts: Int,
+    retryDelayMillis: Long,
+    sleep: (Long) -> Unit,
+    attempt: () -> List<T>,
+): List<T> {
+    var bindings = attempt()
+    var tries = 1
+    while (bindings.isEmpty() && tries < maxAttempts) {
+        sleep(retryDelayMillis)
+        bindings = attempt()
+        tries += 1
+    }
+    return bindings
+}
+
 data class CarPlayBonjourEndpoint(
     val serviceName: String,
     val host: String,
@@ -313,16 +335,24 @@ class CarPlayBonjour(
                     // Some Android 4.x MulticastSocket implementations bind port 5353
                     // before enabling SO_REUSEADDR, so the second address family can
                     // fail with EADDRINUSE even if no other process owns the port.
+                    // A fast reconnect can also still hold the port from the previous
+                    // instance's close, so an all-failed bind is retried briefly.
                     val boundFamilies = mutableListOf<String>()
-                    val bindings = bindAvailableMdnsFamilies(
-                        advertisedAddresses,
-                        bind = { address -> JmDNS.create(address, "carplay-${config.deviceId.replace(":", "")}") },
-                        onFailure = { address, failure ->
-                            Log.w(TAG, "mDNS bind failed for " +
-                                (if (address is Inet4Address) "IPv4" else "IPv6") +
-                                "; preserving other advertised families", failure)
-                        },
-                    )
+                    val bindings = bindMdnsWithRetry(
+                        maxAttempts = MDNS_BIND_MAX_ATTEMPTS,
+                        retryDelayMillis = MDNS_BIND_RETRY_DELAY_MILLIS,
+                        sleep = { millis -> runCatching { Thread.sleep(millis) } },
+                    ) {
+                        bindAvailableMdnsFamilies(
+                            advertisedAddresses,
+                            bind = { address -> JmDNS.create(address, "carplay-${config.deviceId.replace(":", "")}") },
+                            onFailure = { address, failure ->
+                                Log.w(TAG, "mDNS bind failed for " +
+                                    (if (address is Inet4Address) "IPv4" else "IPv6") +
+                                    "; preserving other advertised families", failure)
+                            },
+                        )
+                    }
                     // Take ownership of every successfully created socket before registering
                     // the first service: if registration throws, cleanup must close all sockets.
                     interfaceMdns.addAll(bindings.map { it.second })
@@ -712,6 +742,8 @@ class CarPlayBonjour(
         const val READ_TIMEOUT_MILLIS = 3_000
         const val JOIN_TIMEOUT_MILLIS = 2_000L
         const val NSD_REGISTRATION_TIMEOUT_MILLIS = 5_000L
+        const val MDNS_BIND_MAX_ATTEMPTS = 4
+        const val MDNS_BIND_RETRY_DELAY_MILLIS = 750L
         const val REGISTRATION_PENDING = Int.MIN_VALUE
         const val REGISTRATION_OK = Int.MAX_VALUE
         const val FAILURE_NONE = -1

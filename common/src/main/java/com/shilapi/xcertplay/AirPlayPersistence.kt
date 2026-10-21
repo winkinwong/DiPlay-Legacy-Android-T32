@@ -77,6 +77,7 @@ object AirPlayPersistence {
     private const val KEY_CLUSTER_MAP = "cluster_map_enabled"
     private const val KEY_ADB_CLUSTER_ACTIVITY = "adb_cluster_activity_enabled"
     private const val KEY_CENTER_MAP_OVERLAY = "center_map_overlay"
+    private const val KEY_FLOATING_DOT = "floating_dot"
     private const val KEY_CENTER_MAP_AUTO_HIDE = "center_map_auto_hide"
     private const val KEY_LAUNCHER_MAP_SHARING = "launcher_map_sharing"
     private const val KEY_CLUSTER_MAP_SCALE = "cluster_map_scale_percent"
@@ -705,6 +706,14 @@ object AirPlayPersistence {
 
     fun saveCenterMapOverlay(context: Context, enabled: Boolean) {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putBoolean(KEY_CENTER_MAP_OVERLAY, enabled).apply()
+    }
+
+    /** Issue #119: the draggable floating dot that opens DiPlay on tap. */
+    fun loadFloatingDot(context: Context): Boolean =
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean(KEY_FLOATING_DOT, false)
+
+    fun saveFloatingDot(context: Context, enabled: Boolean) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putBoolean(KEY_FLOATING_DOT, enabled).apply()
     }
 
     /** Whether to renegotiate resolution when entering/exiting freeform floating windows or launcher PiP. */

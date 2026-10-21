@@ -388,7 +388,10 @@
     <string name="use_usage_content_type_routing_instead_of_stream_type">使用 usage / content-type 路由取代串流類型</string>
     <string name="use_your_last_connection_type_and_selected_iphone">使用上次的連線方式和已選擇的 iPhone。</string>
     <string name="vpn_consent_was_denied">VPN 授權遭拒</string>
+    <string name="floating_dot">悬浮小白點</string>
+    <string name="floating_dot_description">在畫面顯示可拖曳的小白點，點擊開啟 DiPlay（適用於無法新增桌面捷徑的車機）</string>
     <string name="waiting_for_iphone_over_usb">正在等待透過 USB 連線的 iPhone</string>
+    <string name="waiting_for_iphone_to_join_wifi">正在等待 iPhone 連上 Wi‑Fi，最長可能需要半分鐘</string>
     <string name="waiting_for_mfi_coprocessor">正在等待 MFi 協同處理器</string>
     <string name="waiting_for_paired_iphone">正在等待 iPhone — 請在 iPhone 設定 > 通用 > CarPlay 裡點 DiPlay</string>
     <string name="wi_fi_direct_is_still_busy_close_the_other_projection_app">Wi-Fi Direct 仍被使用中。請關閉其他投放 App 後再試一次。</string>

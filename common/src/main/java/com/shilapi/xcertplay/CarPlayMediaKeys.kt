@@ -174,7 +174,7 @@ internal object CarPlayMediaKeys {
         }
         focusHeld = result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
         if (focusHeld) forwardGrantedFocusLocked()
-        Log.i(TAG, "audio focus regained=$focusHeld")
+        keyLog("audio focus regained=$focusHeld")
     }
 
     private fun updateLocked(active: Boolean) {
@@ -234,7 +234,7 @@ internal object CarPlayMediaKeys {
                 audio?.registerRemoteControlClient(it)
             }
         }
-        Log.i(TAG, "media keys active focusGranted=$granted")
+        keyLog("media keys active focusGranted=$granted transport=${if (Build.VERSION.SDK_INT >= 21) "MediaSession" else "RemoteControlClient"}")
     }
 
     private fun forwardGrantedFocusLocked() {
@@ -261,7 +261,7 @@ internal object CarPlayMediaKeys {
             }
         }
         if (!current) return
-        Log.i(TAG, "audio focus change=$change")
+        keyLog("audio focus change=$change")
         // Resolve the matching sink and invoke it outside the media-key monitor. An abandoned
         // request must never mute a newer controller, and these owners must not nest locks.
         val background = CarPlayBackgroundSession.snapshot()
@@ -326,15 +326,26 @@ internal object CarPlayMediaKeys {
         )
     }
 
+    /**
+     * Media-key diagnostics reach the exported report, not just logcat: user-submitted diagnostic
+     * reports capture only the controller's report stream, so wheel-key failures (issue #3) were
+     * invisible. The controller is read under the monitor and called outside it to avoid nesting.
+     */
+    private fun keyLog(message: String) {
+        Log.i(TAG, message)
+        val target = synchronized(this) { controller }
+        target?.mediaKeyDiagnostic(message)
+    }
+
     private fun send(index: Int, source: String) {
         // While the car's video player is on screen the wheel drives it: a CarPlay play/pause would
         // make the iPhone end the video session.
         if (CarPlayVideo.onMediaKey(index)) {
-            Log.i(TAG, "media key $source -> car video player $index")
+            keyLog("media key $source -> car video player $index")
             return
         }
         val sent = synchronized(this) { controller }?.sendMediaButton(index) ?: false
-        Log.i(TAG, "media key $source -> CarPlay $index sent=$sent")
+        keyLog("media key $source -> CarPlay $index sent=$sent")
     }
 
     private val callback by lazy { if (Build.VERSION.SDK_INT >= 21) CarPlayMediaCallback(
@@ -344,7 +355,19 @@ internal object CarPlayMediaKeys {
 
     fun onLegacyMediaButton(intent: Intent) {
         if (Build.VERSION.SDK_INT >= 21 || intent.action != Intent.ACTION_MEDIA_BUTTON) return
+        handleLegacyMediaButton(intent)
+    }
+
+    /**
+     * The API 19 media-button broadcast body, split out so the legacy steering-wheel path is testable
+     * without a KitKat Robolectric runtime. Arrival is logged before any filtering so the exported
+     * report shows whether the head unit delivered the key at all (issue #3).
+     */
+    internal fun handleLegacyMediaButton(intent: Intent) {
         val event = intent.getParcelableExtra<KeyEvent>(Intent.EXTRA_KEY_EVENT) ?: return
+        // Raw keyCode is logged alongside the symbolic name: an unrecognised wheel key shows its
+        // number even when keyCodeToString cannot name it, which is the point of the diagnostic.
+        keyLog("legacy RCC receiver keyCode=${event.keyCode} (${KeyEvent.keyCodeToString(event.keyCode)}) action=${event.action} repeat=${event.repeatCount}")
         if (event.action != KeyEvent.ACTION_DOWN || event.repeatCount != 0) return
         val index = CarPlayMediaButton.forKeyCode(event.keyCode) ?: return
         send(index, KeyEvent.keyCodeToString(event.keyCode))

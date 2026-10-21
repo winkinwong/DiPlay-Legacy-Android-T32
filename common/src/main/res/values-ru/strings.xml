@@ -377,7 +377,10 @@
     <string name="use_usage_content_type_routing_instead_of_stream_type">Маршрутизация по использованию/типу контента вместо типа потока</string>
     <string name="use_your_last_connection_type_and_selected_iphone">Использовать последний способ подключения и выбранный iPhone.</string>
     <string name="vpn_consent_was_denied">Согласие на VPN отклонено</string>
+    <string name="floating_dot">Плавающая точка</string>
+    <string name="floating_dot_description">Показывает перетаскиваемую точку на экране; коснитесь её, чтобы открыть DiPlay (для головных устройств, которые не могут добавлять ярлыки на рабочий стол)</string>
     <string name="waiting_for_iphone_over_usb">Ожидание iPhone по USB</string>
+    <string name="waiting_for_iphone_to_join_wifi">Ожидаем подключения iPhone к Wi‑Fi; это может занять до полуминуты</string>
     <string name="waiting_for_mfi_coprocessor">Ожидание сопроцессора MFi</string>
     <string name="waiting_for_paired_iphone">Ожидание iPhone — нажмите DiPlay в настройках iPhone > Основные > CarPlay</string>
     <string name="wi_fi_direct_is_still_busy_close_the_other_projection_app">Wi-Fi Direct всё ещё занят. Закройте другое приложение проекции и повторите.</string>

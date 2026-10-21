@@ -1279,6 +1279,18 @@ class DiPlayActivity : ComponentActivity() {
                 matchButton(12, 60),
             )
             card.addView(label(getString(R.string.settings_car_bluetooth_mac_subtitle), 14, MUTED).apply { setPadding(0, dp(4), 0, 0) })
+            // Issue #119: 悬浮小白点，点击打开 DiPlay（部分车机无法添加桌面快捷方式）
+            toggle(
+                card,
+                getString(R.string.floating_dot),
+                getString(R.string.floating_dot_description),
+                AirPlayPersistence.loadFloatingDot(this),
+            ) { enabled ->
+                AirPlayPersistence.saveFloatingDot(this, enabled)
+                if (enabled && !FloatingDotOverlay.permitted(this)) openOverlayPermission()
+                else FloatingDotOverlay.setEnabled(this, enabled)
+                render()
+            }
             toggle(
                 card,
                 getString(R.string.settings_stop_ipod_service),

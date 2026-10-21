@@ -59,6 +59,7 @@ import com.shilapi.xcertplay.network.WirelessHotspotInfo
 import com.shilapi.xcertplay.network.WirelessHotspotBackend
 import com.shilapi.xcertplay.network.WirelessHotspotManager
 import com.shilapi.xcertplay.network.WirelessInterfaceDiagnostics
+import com.shilapi.xcertplay.network.WirelessLinkHealthMonitor
 import com.shilapi.xcertplay.network.WirelessReceiveDiagnostics
 import com.shilapi.xcertplay.network.WirelessStartupPolicy
 import com.shilapi.xcertplay.network.WirelessStartupException
@@ -129,6 +130,12 @@ sealed class CarPlayStatus {
     data object WaitingForPairedIphone : CarPlayStatus()
     data object ConnectingBluetooth : CarPlayStatus()
     data object RunningWireless : CarPlayStatus()
+    /**
+     * StartSession is sent and the BT control channel is healthy, but the iPhone has not opened
+     * the AirPlay TCP yet. Measured at 20-30 s after a cold or reconnect start on the HSAE NTDA3,
+     * so this is the longest wait of the whole bring-up and deserves its own visible stage.
+     */
+    data object WaitingForIphoneWifi : CarPlayStatus()
     data object WirelessActive : CarPlayStatus()
     data object WirelessActiveFallback : CarPlayStatus()
     data object DiscoveringIphone : CarPlayStatus()
@@ -272,6 +279,8 @@ class CarPlayController(
     @Volatile private var hotspot: WirelessHotspotManager? = null
     @Volatile private var wifiScanPause: WifiScanPause? = null
     @Volatile private var bonjour: CarPlayBonjour? = null
+    // Background JmDNS closes live in the companion (see pendingBonjourCloses): a reconnect
+    // builds a NEW controller, so the fresh instance must see the previous one's pending close.
     private val wirelessResourceLock = Any()
     private val wirelessFailureReported = AtomicBoolean(false)
     @Volatile private var firstTcpWatchdog: FirstTcpWatchdog? = null
@@ -285,6 +294,8 @@ class CarPlayController(
         Thread(task, "diplay-first-tcp-timeout").apply { isDaemon = true }
     }.apply { if (Build.VERSION.SDK_INT >= 21) removeOnCancelPolicy = true }
     @Volatile private var wirelessDiagnostics: WirelessStartupDiagnostics? = null
+    /** Sessionscope link health; the stall reporter reads its latest snapshot. */
+    @Volatile private var wirelessLinkHealth: WirelessLinkHealthMonitor? = null
     @Volatile private var bluetoothSocket: BluetoothSocket? = null
     @Volatile private var bluetoothStream: BlockingDuplexByteStream? = null
     @Volatile private var wirelessTunnelChannel: Iap2Session? = null
@@ -1282,6 +1293,14 @@ class CarPlayController(
             )
             var startedBonjour: CarPlayBonjour? = null
             val receiveDiagnostics = WirelessReceiveDiagnostics(hotspotInfo.interfaceName)
+            // The link health monitor outlives the startup diagnostics: a stall says frames
+            // stopped arriving, and only the wlan counters plus the AP-side radio level can say
+            // whether the receive path kept receiving or the radio went quiet. Sampling during
+            // bring-up alone left the stalls the driver actually feels unexplained.
+            wirelessLinkHealth = WirelessLinkHealthMonitor(
+                interfaceName = hotspotInfo.interfaceName,
+                log = { message -> if (!isStaleWirelessRun(generation)) debugLog(message) },
+            )
             val diagnostics = WirelessStartupDiagnostics(
                 sample = {
                     "${WirelessInterfaceDiagnostics.snapshot(hotspotInfo.interfaceName)} " +
@@ -1437,6 +1456,9 @@ class CarPlayController(
             )
             synchronized(wirelessResourceLock) {
                 if (isStaleWirelessRun(generation)) return
+                // The previous run's JmDNS closes in the background; wait until
+                // it released the mDNS port or the new bind fails outright.
+                awaitPendingBonjourClose(3_000L)
                 bonjour = bonjourClient
                 startedHotspot?.validateReady()
                 bonjourClient.start()
@@ -1514,7 +1536,13 @@ class CarPlayController(
                             timeoutMillis = WIRELESS_BOOTSTRAP_TIMEOUT_MILLIS,
                             keepAliveAfterDeadline = { keepBluetoothControlAlive(generation) },
                             beforeStartSession = { startedHotspot?.validateReady() },
-                            onStartSessionSent = { watchdog.startSessionSent(it.sentAtNanos) },
+                            onStartSessionSent = {
+                                // The iPhone now owns the pace: it takes ~20-30 s to open the AirPlay
+                                // TCP (measured on the NTDA3). Say so, instead of leaving the driver
+                                // on "control channel running" with no idea how long this takes.
+                                onStatus(CarPlayStatus.WaitingForIphoneWifi)
+                                watchdog.startSessionSent(it.sentAtNanos)
+                            },
                             onIncoming = ::onRouteFrame,
                             onProgress = { message ->
                                 diagnostics.controlProgress(message)
@@ -1742,6 +1770,9 @@ class CarPlayController(
                     it.sessionActive()
                     it.close()
                 }
+                // Startup observation ends here; the link health monitor keeps sampling so a
+                // later stall can name the cause instead of only the symptom.
+                wirelessLinkHealth?.start()
                 wirelessConnectionProof.activate(generation, session)
                 // Keep wirelessActiveReported false until maybeCompleteWirelessHandoff() closes
                 // the Bluetooth bootstrap after the tunneled iAP2 channel is ready.
@@ -2723,6 +2754,28 @@ class CarPlayController(
         }
     }
 
+    /**
+     * JmDNS close() blocks for seconds on Android 4.4 and releases the mDNS
+     * port only when it finishes. The bring-up waits here so its fresh bind
+     * cannot race a still-closing socket ("Interface mDNS could not bind on
+     * any advertised address" killed the first reconnect after the screen
+     * stream reset). Returns false when a close outlived the budget;
+     * starting anyway beats deadlocking the reconnect.
+     */
+    private fun awaitPendingBonjourClose(timeoutMillis: Long): Boolean {
+        var allJoined = true
+        synchronized(pendingBonjourCloseLock) {
+            val iterator = pendingBonjourCloses.iterator()
+            while (iterator.hasNext()) {
+                val thread = iterator.next()
+                runCatching { thread.join(timeoutMillis) }
+                if (thread.isAlive) allJoined = false else iterator.remove()
+            }
+        }
+        if (!allJoined) debugLog("Bonjour close still running after ${timeoutMillis}ms; starting the new one anyway")
+        return allJoined
+    }
+
     private fun closeWirelessStack(service: CarPlayVpnService? = vpnService, generation: Int? = null) =
         synchronized(wirelessResourceLock) {
             if (generation != null && generation != wirelessGeneration.get()) return@synchronized
@@ -2730,6 +2783,7 @@ class CarPlayController(
             firstTcpWatchdog?.terminate()
             val diagnostics = wirelessDiagnostics
             wirelessDiagnostics = null
+            wirelessLinkHealth?.let { it.close(); wirelessLinkHealth = null }
             diagnostics?.close()
             wirelessConnectionProof.clear()
             media.setIapTunnelHandler(null)
@@ -2741,7 +2795,26 @@ class CarPlayController(
 
             val activeBonjour = bonjour
             bonjour = null
-            if (activeBonjour != null) closeBestEffort("Bonjour") { activeBonjour.close() }
+            if (activeBonjour != null) {
+                // JmDNS close() unregisters its services over multicast and
+                // can block for seconds on Android 4.4; a reconnect must
+                // not wait for it. The next run registers a fresh instance,
+                // so the old instance's goodbye packets are harmless in
+                // the background.
+                val closer = Thread(
+                    { closeBestEffort("Bonjour") { activeBonjour.close() } },
+                    "xcertplay-bonjour-close",
+                ).apply {
+                    isDaemon = true
+                    start()
+                }
+                // Registered in the companion list so the next bring-up's await joins it even
+                // when that bring-up runs on a brand-new controller instance.
+                synchronized(pendingBonjourCloseLock) {
+                    pendingBonjourCloses.removeAll { !it.isAlive }
+                    pendingBonjourCloses.add(closer)
+                }
+            }
 
             val activeHotspot = hotspot
             hotspot = null
@@ -2994,6 +3067,29 @@ class CarPlayController(
         }
     }
 
+    /**
+     * Steering-wheel/media-key diagnostics for the exported report. The key path otherwise logs only
+     * to logcat, which the diagnostic report does not capture, so wheel-key failures stayed invisible
+     * in user-submitted logs (issue #3). Shares the report stream with [debugLog].
+     */
+    fun mediaKeyDiagnostic(message: String) {
+        debugLog("mediakey $message")
+    }
+
+    /**
+     * Lifecycle decisions made outside the UI (task removal, bring-up policy) for the exported
+     * report: without these the report shows a teardown but never its reason.
+     */
+    fun sessionDiagnostic(message: String) {
+        connectionDiagnostic(message)
+    }
+
+    /**
+     * The sessionscope link health monitor, or null when no wireless run is sampling. The media
+     * engine reads it on every stall so the report names the cause of a starved video stream.
+     */
+    fun linkHealth(): WirelessLinkHealthMonitor? = wirelessLinkHealth
+
     private fun connectionDiagnostic(message: String) {
         try {
             // The redactor reserves "PHONE " for private phone-side log captures.
@@ -3075,6 +3171,8 @@ class CarPlayController(
             "STEP bt/rfcomm: connecting to the iPhone iAP2 RFCOMM service"
         CarPlayStatus.RunningWireless ->
             "STEP iap2/wireless: Bluetooth control loop running"
+        CarPlayStatus.WaitingForIphoneWifi ->
+            "STEP wifi/wait: waiting for the iPhone to open the AirPlay connection"
         CarPlayStatus.WirelessActive ->
             "STEP handoff/complete: tunnel iAP2 ready; Bluetooth bootstrap released"
         CarPlayStatus.WirelessActiveFallback ->
@@ -3108,6 +3206,15 @@ class CarPlayController(
     companion object {
         private const val ENABLE_PHONE_DIAGNOSTIC_CAPTURE = false
         const val CONNECTION_DIAGNOSTIC_PREFIX = "CONNECTION_DIAGNOSTIC"
+        /**
+         * Background JmDNS closes of torn-down runs; [awaitPendingBonjourClose] joins them before a
+         * new bind. Companionscope: a reconnect builds a NEW controller, and the fresh instance's
+         * bring-up must still join the previous instance's close — a per-instance list left the new
+         * bind racing the old socket ("Interface mDNS could not bind on any advertised address"
+         * right after a settings change).
+         */
+        private val pendingBonjourCloses = mutableListOf<Thread>()
+        private val pendingBonjourCloseLock = Any()
         // Android 4.x uses synchronous USB bulk reads; see openNcm().
         private const val ASYNC_USB_READ_MIN_SDK = Build.VERSION_CODES.N
         // Indices in the telephony HID report (AirPlayHid.telephonyDescriptor).

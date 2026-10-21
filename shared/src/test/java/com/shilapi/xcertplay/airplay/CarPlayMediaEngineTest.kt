@@ -4,10 +4,16 @@ import java.io.Closeable
 import java.net.Socket
 import java.math.BigInteger
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.annotation.Config
 
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [28], manifest = Config.NONE)
 class CarPlayMediaEngineTest {
     @Test
     fun streamConnectionIdUsesUnsignedDecimalForHkdfSalt() {
@@ -84,7 +90,45 @@ class CarPlayMediaEngineTest {
         }
     }
 
-    private fun testSession(videoInCar: Boolean = false): AirPlaySession = AirPlaySession(
+    /**
+     * A stall line names the symptom; the link health monitor names the cause. The report must
+     * carry both, and a session without a monitor (wired, tests) must still log the stall itself.
+     */
+    @Test
+    fun stallCarriesTheLinkHealthSnapshotAndSurvivesAMissingMonitor() {
+        val logs = mutableListOf<String>()
+        val session = testSession(videoInCar = true) { logs += it }
+        val engine = CarPlayMediaEngine(object : MediaSink {})
+        val screen = ScreenStream(ByteArray(1) { 1 }, {}, session.localAddress)
+        val streamsField = CarPlayMediaEngine::class.java.getDeclaredField("streams").apply { isAccessible = true }
+        @Suppress("UNCHECKED_CAST")
+        val streams = streamsField.get(engine) as MutableMap<CarPlayMediaEngine.StreamKey, Closeable>
+        streams[CarPlayMediaEngine.StreamKey(session, 110)] = screen
+
+        // Without a monitor the stall still reports, just without the link state.
+        engine.handleReceiveStall(session, 110, screen, 12_000L)
+        assertTrue(logs.any { it.contains("receive stalled 12000ms") })
+        assertFalse(logs.any { it.contains("stall link state") })
+
+        // With a monitor the stall line carries the counters and the radio level.
+        engine.linkHealthProvider = { monitor }
+        engine.handleReceiveStall(session, 110, screen, 12_000L)
+        session.close()
+
+        assertTrue("the link state must ride along: $logs", logs.any { it.contains("stall link state") })
+        assertTrue(logs.any { it.contains("link health") && it.contains("radio=") })
+        assertFalse("no interface name may leak", logs.any { it.contains("wlan0") })
+    }
+
+    private val monitor: com.shilapi.xcertplay.network.WirelessLinkHealthMonitor =
+        com.shilapi.xcertplay.network.WirelessLinkHealthMonitor("wlan0", read = { path, _ ->
+            when (path) {
+                "/proc/net/wireless" -> "wlan0: 42 5 42 0 0 0 0 0 0"
+                else -> "3"
+            }
+        }).also { it.stallSnapshot() }
+
+    private fun testSession(videoInCar: Boolean = false, onDebugLog: (String) -> Unit = {}): AirPlaySession = AirPlaySession(
         socket = Socket(),
         config = AirPlayConfig(
             deviceName = "test",
@@ -97,7 +141,9 @@ class CarPlayMediaEngineTest {
         identity = AirPlayIdentity.generate(),
         pairings = PairingStore(),
         mfi = null,
-        listener = object : AirPlaySessionListener {},
+        listener = object : AirPlaySessionListener {
+            override fun onDebugLog(message: String) { onDebugLog(message) }
+        },
         media = object : AirPlayMediaHandler {},
     )
 }

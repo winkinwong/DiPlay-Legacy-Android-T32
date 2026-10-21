@@ -377,7 +377,10 @@
     <string name="use_usage_content_type_routing_instead_of_stream_type">استخدام توجيه نوع المحتوى/الاستخدام بدلاً من نوع البث</string>
     <string name="use_your_last_connection_type_and_selected_iphone">استخدم نوع اتصالك الأخير وiPhone المحدد.</string>
     <string name="vpn_consent_was_denied">رُفضت موافقة VPN</string>
+    <string name="floating_dot">نقطة عائمة</string>
+    <string name="floating_dot_description">تعرض نقطة عائمة قابلة للسحب على الشاشة؛ انقرها لفتح DiPlay (للشاشات التي لا يمكنها إضافة اختصارات على سطح المكتب)</string>
     <string name="waiting_for_iphone_over_usb">بانتظار iPhone عبر USB</string>
+    <string name="waiting_for_iphone_to_join_wifi">في انتظار انضمام iPhone إلى Wi‑Fi؛ قد يستغرق ذلك حتى نصف دقيقة</string>
     <string name="waiting_for_mfi_coprocessor">بانتظار معالج MFi المساعد</string>
     <string name="waiting_for_paired_iphone">بانتظار iPhone — انقر على DiPlay في إعدادات iPhone > عام > CarPlay</string>
     <string name="wi_fi_direct_is_still_busy_close_the_other_projection_app">ما زال Wi-Fi Direct مشغولاً. أغلق تطبيق العرض الآخر وحاول مجدداً.</string>

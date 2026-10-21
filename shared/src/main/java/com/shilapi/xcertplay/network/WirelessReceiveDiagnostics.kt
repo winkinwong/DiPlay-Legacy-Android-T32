@@ -40,30 +40,6 @@ internal class WirelessReceiveDiagnostics(
         }
     }
 
-    private class CounterSource(private val label: String, private val sample: () -> Map<String, Long>) {
-        private var previous: Map<String, Long>? = null
-        private var unavailable: String? = null
-
-        fun snapshot(): String {
-            unavailable?.let { return "$label=unavailable failureClass=$it" }
-            val current = try { sample() } catch (error: Exception) {
-                val type = error.javaClass.simpleName
-                unavailable = type
-                return "$label=unavailable failureClass=$type"
-            }
-            val before = previous
-            previous = current
-            if (before == null) return "$label=baseline"
-            // Interface recreation or counter wrap must never appear as a negative loss count.
-            if (current.keys != before.keys || current.any { (key, value) -> value < before.getValue(key) }) {
-                return "$label=reset"
-            }
-            return "$label=sampled " + current.entries.joinToString(" ") { (key, value) ->
-                "$label${key}Delta=${value - before.getValue(key)}"
-            }
-        }
-    }
-
     companion object {
         private const val MAX_PROC_BYTES = 16 * 1024
         private val INTERFACE_NAME = Regex("[A-Za-z0-9_.-]{1,15}")
@@ -122,4 +98,32 @@ internal fun readBoundedDiagnosticFile(path: String, maxBytes: Int): String = Fi
     }
     if (count > maxBytes) throw IOException()
     String(bytes, 0, count, Charsets.US_ASCII)
+}
+
+/**
+ * One sampled source of kernel counters: a first sample is the baseline, then deltas. A source that
+ * stops reading says so once instead of retrying, and a counter that moves backwards (interface
+ * recreation, counter wrap) resets the baseline rather than exporting a negative loss count.
+ */
+internal class CounterSource(private val label: String, private val sample: () -> Map<String, Long>) {
+    private var previous: Map<String, Long>? = null
+    private var unavailable: String? = null
+
+    fun snapshot(): String {
+        unavailable?.let { return "$label=unavailable failureClass=$it" }
+        val current = try { sample() } catch (error: Exception) {
+            val type = error.javaClass.simpleName
+            unavailable = type
+            return "$label=unavailable failureClass=$type"
+        }
+        val before = previous
+        previous = current
+        if (before == null) return "$label=baseline"
+        if (current.keys != before.keys || current.any { (key, value) -> value < before.getValue(key) }) {
+            return "$label=reset"
+        }
+        return "$label=sampled " + current.entries.joinToString(" ") { (key, value) ->
+            "$label${key}Delta=${value - before.getValue(key)}"
+        }
+    }
 }

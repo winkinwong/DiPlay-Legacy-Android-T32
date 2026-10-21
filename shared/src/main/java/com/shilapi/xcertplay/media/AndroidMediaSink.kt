@@ -109,7 +109,10 @@ internal class AudioFocusCoordinator(
 
     @Synchronized
     fun acquire(track: AudioTrack, channel: AudioChannel, attributes: Any?) {
-        if (closed || !enabled || manager == null || channel == AudioChannel.NAVIGATION) return
+        if (closed || manager == null || channel == AudioChannel.NAVIGATION) return
+        // Register for volume control even when audio focus is off: duck only changes the renderer's
+        // gain and must lower the music regardless of the focus setting. Focus requests themselves
+        // stay gated by [enabled] inside refreshRequest.
         active[track] = Entry(channel, attributes)
         refreshRequest()
         applyMediaVolume(track, active.getValue(track))
@@ -129,11 +132,17 @@ internal class AudioFocusCoordinator(
     fun close() {
         if (closed) return
         closed = true
+        duckRestore?.let(duckHandler::removeCallbacks)
+        duckRestore = null
+        volumeBeforeDuck = null
         active.clear()
         refreshRequest()
     }
 
     private fun refreshRequest() {
+        // Audio focus is opt-in (the audio-focus setting); duck's volume control is not, so a
+        // disabled coordinator keeps its tracks registered but never requests or abandons focus.
+        if (!enabled) return
         val primary = active.values.maxByOrNull { it.channel.focusPriority() }
         if (primary == null) {
             focusGeneration += 1
@@ -181,6 +190,44 @@ internal class AudioFocusCoordinator(
         if (entry.channel != AudioChannel.MEDIA || entry.appliedVolume == mediaVolume) return
         val applied = runCatching { track.setStereoVolume(mediaVolume, mediaVolume) == AudioTrack.SUCCESS }.getOrDefault(false)
         if (applied) entry.appliedVolume = mediaVolume
+    }
+
+    private var duckRestore: Runnable? = null
+    private var volumeBeforeDuck: Float? = null
+    // Lazy: plain-JUnit sink tests never duck and must not touch the main looper.
+    private val duckHandler by lazy { Handler(Looper.getMainLooper()) }
+
+    /**
+     * duckAudio from the iPhone: lower the MEDIA stream at once, restore the
+     * pre-duck volume when [durationMs] elapses or [unduckMedia] arrives.
+     * Navigation guidance never enters this map, so it stays at full volume.
+     */
+    fun duckMedia(durationMs: Long, volume: Float) {
+        if (volumeBeforeDuck == null) volumeBeforeDuck = mediaVolume
+        duckRestore?.let(duckHandler::removeCallbacks)
+        duckRestore = null
+        val ducked = volume.coerceIn(0f, 1f)
+        setMediaVolume(ducked)
+        // Say duck ran and what it acted on: a silent no-op (no media track) must be visible.
+        runCatching { report("Audio: duck volume=$ducked restoreIn=${durationMs}ms activeTracks=${active.size}") }
+        if (durationMs > 0) {
+            val restore = Runnable {
+                duckRestore = null
+                volumeBeforeDuck?.let(::setMediaVolume)
+                volumeBeforeDuck = null
+            }
+            duckRestore = restore
+            duckHandler.postDelayed(restore, durationMs)
+        }
+    }
+
+    fun unduckMedia() {
+        duckRestore?.let(duckHandler::removeCallbacks)
+        duckRestore = null
+        val restored = volumeBeforeDuck
+        restored?.let(::setMediaVolume)
+        volumeBeforeDuck = null
+        runCatching { report("Audio: unduck restored=${restored ?: "none"} activeTracks=${active.size}") }
     }
 
     private fun AudioChannel.focusPriority(): Int = when (this) {
@@ -489,6 +536,14 @@ class AndroidMediaSink(
             videoDecoder(type).submit(naluBytes, senderNanos, arrivalNanos)
             mirrorDecoders(type).forEach { it.submit(naluBytes) }
         }
+    }
+
+    override fun duckMedia(durationMs: Long, volume: Float) {
+        audioFocusCoordinator.duckMedia(durationMs, volume)
+    }
+
+    override fun unduckMedia() {
+        audioFocusCoordinator.unduckMedia()
     }
 
     override fun onScreenStreamActive(type: Int, active: Boolean) {

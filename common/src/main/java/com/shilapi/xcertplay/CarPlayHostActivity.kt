@@ -545,8 +545,11 @@ class CarPlayHostActivity : ComponentActivity() {
             videoSurfaceOwner.replace(surface, releaseOnDetach = false)
             appendLog("SurfaceView video surface created valid=${surface.isValid}")
             attachSurface(surface)
-            // A still CarPlay screen sends no frames, so ask for one instead of showing the parked gap.
-            if (smoothVideo) sink?.refreshPicture(SCREEN_TYPE_MAIN)
+            // A still CarPlay screen sends no frames, so ask for one instead of showing the parked
+            // gap. Unconditional: after the reverse camera or a task switch the iPhone can take
+            // seconds to resume screen capture, and waiting for the stall detector (2 s) first only
+            // lengthened the black screen the driver sees.
+            sink?.refreshPicture(SCREEN_TYPE_MAIN)
             videoView?.let { updateVideoLayout(it.width, it.height) }
         }
 
@@ -576,6 +579,10 @@ class CarPlayHostActivity : ComponentActivity() {
         NavigationWidgetUpdater.attach(applicationContext)
         CarPlayCallKeys.install(applicationContext)
         CenterMapOverlay.requestShow = ::showCenterMap
+        // This screen owns the dot's suppression: keep it off the projection from the start, and the
+        // lifecycle below restores it only once CarPlay is no longer in front.
+        FloatingDotOverlay.setCarPlayVisible(this, true)
+        FloatingDotOverlay.restoreIfEnabled(applicationContext)
         MapMirrors.sink = mirrorSink
         MapMirrors.onChanged = mirrorsChanged
         languagePreferenceAtCreate = AppLocale.preference(this)
@@ -862,6 +869,7 @@ class CarPlayHostActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        FloatingDotOverlay.setCarPlayVisible(this, true)
         val savedNightMode = AirPlayPersistence.loadCarPlayNightMode(this)
         val savedThreshold = AirPlayPersistence.loadAmbientLightThreshold(this)
         val savedDelay = AirPlayPersistence.loadAmbientDelaySeconds(this)
@@ -1199,6 +1207,12 @@ class CarPlayHostActivity : ComponentActivity() {
 
     // Hardware navigation belongs to the iPhone-rendered CarPlay UI, not Android View focus.
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        // Wheel media keys normally fall through to the media-button receiver, so seeing one here
+        // means the head unit dispatched it to the foreground window too (issue #3 evidence).
+        if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0 &&
+            CarPlayMediaButton.forKeyCode(event.keyCode) != null) {
+            appendLog("mediakey activity window saw media key ${KeyEvent.keyCodeToString(event.keyCode)}")
+        }
         val physicalKey = Triple(event.deviceId, event.keyCode, event.scanCode)
         val downOrUp = event.action == KeyEvent.ACTION_DOWN || event.action == KeyEvent.ACTION_UP
         if (downOrUp && physicalKey in legacySiriPresses) {
@@ -1275,6 +1289,7 @@ class CarPlayHostActivity : ComponentActivity() {
     }
 
     override fun onPause() {
+        FloatingDotOverlay.setCarPlayVisible(this, false)
         nightModeController.pause()
         super.onPause()
     }
@@ -1406,7 +1421,12 @@ class CarPlayHostActivity : ComponentActivity() {
         currentSurfaceTexture = null
         fallbackVideoView = null
         fallbackVideoBounds = null
-        sessionLog?.append("Activity destroyed")
+        // Backstop: onCreate can take the dot's CarPlay suppression and then finish without ever
+        // reaching onPause, which would otherwise leave the dot hidden for the process's life.
+        FloatingDotOverlay.setCarPlayVisible(this, false)
+        // finishing=true means the task was removed (or the activity finished), not a config change:
+        // the report should name which kind of destroy preceded a reconnect.
+        sessionLog?.append("Activity destroyed finishing=$isFinishing taskRoot=$isTaskRoot")
         sessionLog?.close()
         if (crashDiagnosticLog === sessionLog) crashDiagnosticLog = null
         sessionLog = null
@@ -3935,7 +3955,11 @@ class CarPlayHostActivity : ComponentActivity() {
             sink = sink,
             microphoneEnabled = microphoneAvailable,
             audioCaptureDirectory = audioCaptureDirectory(),
-        )
+        ).apply {
+            // Resolved lazily: the engine is built before the controller exists, and the monitor
+            // only appears once a wireless run starts sampling.
+            linkHealthProvider = { controller?.linkHealth() }
+        }
 
     private fun createSessionListener(controllerGeneration: Int): AirPlaySessionListener =
         object : AirPlaySessionListener {
@@ -4574,7 +4598,12 @@ class CarPlayHostActivity : ComponentActivity() {
         val generation = restartGeneration
         val delayMillis = if (startupDelay != null) {
             startupDelay
-        } else if (reason.contains("AirPlay iAP tunnel", ignoreCase = true)) {
+        } else if (reason.contains("iAP2 tunnel", ignoreCase = true) ||
+            reason.contains("iAP tunnel", ignoreCase = true)
+        ) {
+            // The iPhone closed the AirPlay session itself (its own power policy or a BT/Wi-Fi
+            // wobble); it needs ~20-30 s to come back no matter how fast we rebuild, so the only
+            // part DiPlay controls is not adding its own delay on top.
             IAP_TUNNEL_RECONNECT_DELAY_MILLIS
         } else {
             (RECONNECT_DELAY_MILLIS * (1L shl reconnectAttempts.coerceAtMost(4))).coerceAtMost(30_000L)
@@ -4808,6 +4837,9 @@ class CarPlayHostActivity : ComponentActivity() {
         oldSink?.let(retiringSinks::add)
         sink = null
         sessionDisplay = null
+        // Into the report, not only logcat: the exported report otherwise shows a teardown
+        // but never the reason that ordered it.
+        appendLog("shutdown reason=$reason terminateProcess=$terminateProcess")
         Log.i(TAG, "shutdown reason=$reason terminateProcess=$terminateProcess")
         teardownExecutor.execute {
             oldController?.close()
@@ -5087,6 +5119,10 @@ class CarPlayHostActivity : ComponentActivity() {
             message.contains("Could not", true) ->
             getString(R.string.connection_interrupted_retrying)
         message.contains("Waiting for iPhone", true) || message.contains("Discovering iPhone", true) -> getString(R.string.connect_your_iphone_with_a_usb_cable)
+        // After StartSession the iPhone needs ~20-30 s to open the AirPlay TCP; name the wait so
+        // the driver does not think it is stuck on the control channel.
+        message.contains("waiting for the iPhone to open the AirPlay", true) ->
+            getString(R.string.waiting_for_iphone_to_join_wifi)
         message.contains("paired", true) -> getString(R.string.looking_for_your_paired_iphone)
         message.contains("Bluetooth", true) -> getString(R.string.connecting_to_your_iphone)
         message.contains("reconnect", true) || message.contains("ended", true) -> getString(R.string.reconnecting_to_your_iphone)
@@ -5252,6 +5288,7 @@ class CarPlayHostActivity : ComponentActivity() {
         CarPlayStatus.WaitingForPairedIphone -> getString(R.string.waiting_for_paired_iphone)
         CarPlayStatus.ConnectingBluetooth -> getString(R.string.connecting_bluetooth)
         CarPlayStatus.RunningWireless -> getString(R.string.wireless_carplay_control_running)
+        CarPlayStatus.WaitingForIphoneWifi -> getString(R.string.waiting_for_iphone_to_join_wifi)
         CarPlayStatus.WirelessActive, CarPlayStatus.WirelessActiveFallback -> getString(R.string.wireless_carplay_active)
         CarPlayStatus.DiscoveringIphone -> getString(R.string.discovering_iphone)
         CarPlayStatus.WaitingForIphone -> getString(R.string.waiting_for_iphone_over_usb)
@@ -5285,7 +5322,10 @@ class CarPlayHostActivity : ComponentActivity() {
         const val DISPLAY_CHANGE_DEBOUNCE_MILLIS = 500L
         const val CONFIGURATION_POLL_INTERVAL_MILLIS = 2_000L
         const val RECONNECT_DELAY_MILLIS = 2_000L
-        const val IAP_TUNNEL_RECONNECT_DELAY_MILLIS = 15_000L
+        // The iPhone needs ~20-30 s to accept the AirPlay TCP after StartSession, so sending
+        // StartSession earlier starts its clock earlier: a short delay still lets the old stack
+        // tear down (measured 60-90 ms) without adding to the recovery the driver waits for.
+        const val IAP_TUNNEL_RECONNECT_DELAY_MILLIS = 3_000L
         const val CONTROLLER_CLOSE_TIMEOUT_MILLIS = 4_000L
         const val AUDIO_CAPTURE_MARKER = "audio-capture.enabled"
         const val AUDIO_CAPTURE_DIRECTORY = "audio-captures"
