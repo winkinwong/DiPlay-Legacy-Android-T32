@@ -1,3 +1,14 @@
+# DiPlay 0.2.46-t32.4 — 2026-10-21
+
+- Floating dot launcher: a small overlay dot opens DiPlay from the head-unit desktop; it hides itself while CarPlay is on screen and on the lock screen (ported from upstream #119, scoped for this head unit).
+- Wireless smoothness: echo AirPlay keepalive probes and advertise keepAliveLowPower so the iPhone may idle in low-power mode — the multi-second stalls that clustered in the first minutes after (re)connect are reduced; validated over three road tests on 2026-10-20/21.
+- Wireless smoothness: receive stalls no longer tear the session down (keyframe request instead), the picture refreshes on every surface recreation, the first-TCP watchdog widens to 60 s (measured iPhone connect 20.7–30.7 s), the iAP2 tunnel reconnect delay drops to 3 s, and the mDNS rebind race that failed reconnects is fixed — reconnect median went from 29–38 s to ~9 s.
+- Navigation ducking: duckAudio/unduckAudio from the iPhone now lower head-unit music during turn-by-turn prompts and restore it afterwards, decoupled from the audio-focus setting.
+- Session survival: swiping DiPlay from recents no longer kills an active session on non-BYD head units; reverse-camera returns show the picture sooner via the unconditional keyframe refresh.
+- Diagnostics: a link-health monitor samples NIC counters and /proc/net/wireless radio level every 10 s during wireless sessions, stall reports carry a link snapshot, and steering-wheel media keys plus lifecycle events reach the exported report.
+
+**All versions in this repository are optimized for the 2020 Nissan X-Trail (T32 platform, Android 4.4.2); other models must test on their own.**
+
 # DiPlay 0.2.46-t32.3 — 2026-10-16
 
 - Wireless CarPlay now bridges the vendor AnwPhoneLink Bluetooth stack: head units with no framework BluetoothAdapter and no HSAE Bluetooth service (like this X-Trail, which previously failed wireless with "No Bluetooth adapter") get wireless CarPlay; the paired-phone list is queried through the AnwPhoneLink service and the iAP2 RFCOMM/SPP channel runs over it.
