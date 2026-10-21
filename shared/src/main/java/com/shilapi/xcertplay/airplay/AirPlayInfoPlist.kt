@@ -44,7 +44,11 @@ object AirPlayInfoPlist {
             "bluetoothIDs" to listOf(config.btMac),
             "name" to config.deviceName,
             "rightHandDrive" to config.rightHandDrive,
-            "keepAliveLowPower" to false,
+            // The receiver echoes every keepalive probe (AirPlaySession.runKeepAlive), so the
+            // iPhone may drop into its low-power idle state on a still screen. Advertising false
+            // while the phone asked for it made iOS keep the radio awake and re-negotiate
+            // periodically, which showed up as multi-second stalls on the HSAE NTDA3.
+            "keepAliveLowPower" to true,
             "keepAliveSendStatsAsBody" to false,
             "modes" to modes(),
         )

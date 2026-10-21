@@ -54,6 +54,9 @@ interface AirPlayMediaHandler {
     fun onBufferedAudioControl(session: AirPlaySession, method: String, body: Map<String, Any?>): Map<String, Any?>? = null
     fun onFeedback(session: AirPlaySession): Map<String, Any?>? = null
     fun onTeardown(session: AirPlaySession, type: Int) {}
+    /** duckAudio/unduckAudio: the iPhone lowers the music stream while guidance speaks. */
+    fun onDuckAudio(durationMs: Long, volume: Float) {}
+    fun onUnduckAudio() {}
     fun onSessionClosed(session: AirPlaySession) {}
     fun setIapTunnelHandler(handler: ((BlockingDuplexByteStream) -> Boolean)?) {}
     fun onSetupResponseSent(session: AirPlaySession) {}
@@ -766,6 +769,13 @@ class AirPlaySession(
         } else if (type == "requestUI") {
             listener.onHostUiRequested(this)
         }
+        when (type) {
+            "duckAudio" -> media.onDuckAudio(
+                (params["durationMs"] as? Number)?.toLong() ?: 0L,
+                (params["volume"] as? Number)?.toFloat() ?: 0.2f,
+            )
+            "unduckAudio" -> media.onUnduckAudio()
+        }
         listener.onCommand(this, type, params)
         return RtspMessage.Response(status = 200)
     }
@@ -817,11 +827,26 @@ class AirPlaySession(
         val buffer = ByteArray(512)
         while (!closed.get()) {
             try {
-                socket.receive(DatagramPacket(buffer, buffer.size))
+                val packet = DatagramPacket(buffer, buffer.size)
+                socket.receive(packet)
+                echoKeepAlive(packet) { reply -> socket.send(reply) }
             } catch (_: Exception) {
                 if (closed.get()) return
             }
         }
+    }
+
+    /**
+     * AirPlay keepalive is an echo: the receiver answers every probe with the same payload, and
+     * only a receiver that echoes may advertise keepAliveLowPower. Without the echo the iPhone
+     * cannot drop into its low-power idle state during a still screen, so it keeps the Wi-Fi
+     * radio awake and periodically re-negotiates — measured as multi-second stalls and
+     * peer-initiated teardown on the HSAE NTDA3. A failed echo must not end the loop.
+     */
+    internal fun echoKeepAlive(packet: DatagramPacket, send: (DatagramPacket) -> Unit) {
+        if (packet.length <= 0) return
+        val address = packet.address ?: return
+        runCatching { send(DatagramPacket(packet.data, packet.length, address, packet.port)) }
     }
 
     private fun openEvent(): Int {

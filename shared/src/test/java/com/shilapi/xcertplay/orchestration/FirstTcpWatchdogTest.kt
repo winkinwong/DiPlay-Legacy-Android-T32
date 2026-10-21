@@ -2,6 +2,7 @@ package com.shilapi.xcertplay.orchestration
 
 import com.shilapi.xcertplay.airplay.AirPlayListenerIdentity
 import com.shilapi.xcertplay.airplay.AirPlayTcpAccepted
+import com.shilapi.xcertplay.network.WirelessStartupPolicy
 import org.junit.Assert.*
 import org.junit.Test
 import java.util.concurrent.CountDownLatch
@@ -14,6 +15,9 @@ class FirstTcpWatchdogTest {
     private var timer: (() -> Unit)? = null
     private var failures = 0
     private val identity = AirPlayListenerIdentity(7)
+    // The watchdog's budget: the HSAE NTDA3 measured 20-30 s for the iPhone to open the AirPlay
+    // TCP, so tests advance the fake clock by the policy value rather than a hard-coded number.
+    private val budget = WirelessStartupPolicy.FIRST_TCP_MILLIS
     private fun watchdog() = FirstTcpWatchdog(identity, { delay, action ->
         deadline = now + delay
         timer = action
@@ -25,7 +29,7 @@ class FirstTcpWatchdogTest {
 
     @Test fun noSuccessfulStartSessionDoesNotArmTimer() {
         watchdog()
-        now = 60_000
+        now = budget
         assertNull(timer)
         assertEquals(0, failures)
     }
@@ -35,8 +39,8 @@ class FirstTcpWatchdogTest {
         watch.startSessionSent(0)
         now = 20_000
         watch.startSessionSent(now * 1_000_000)
-        assertEquals(30_000L, deadline)
-        now = 30_000
+        assertEquals("the first StartSession owns the deadline", budget, deadline)
+        now = budget
         timer!!()
         assertEquals(1, failures)
         assertTrue(watch.terminated)
@@ -59,7 +63,7 @@ class FirstTcpWatchdogTest {
         assertFalse(watch.accepted(event(internal = true)))
         assertFalse(watch.accepted(event(AirPlayListenerIdentity(6))))
         assertFalse(watch.accepted(event(AirPlayListenerIdentity(7))))
-        now = 30_000
+        now = budget
         timer!!()
         assertEquals(1, failures)
     }
@@ -67,7 +71,7 @@ class FirstTcpWatchdogTest {
     @Test fun acceptWinsAgainstAlreadyQueuedTimeout() {
         val watch = watchdog()
         watch.startSessionSent(0)
-        now = 30_000
+        now = budget
         assertTrue(watch.accepted(event()))
         timer!!()
         assertEquals(0, failures)
@@ -77,7 +81,7 @@ class FirstTcpWatchdogTest {
     @Test fun timeoutWinsAndLateAcceptCannotRevive() {
         val watch = watchdog()
         watch.startSessionSent(0)
-        now = 30_000
+        now = budget
         timer!!()
         assertFalse(watch.accepted(event()))
         assertFalse(watch.sessionEstablished())
@@ -90,7 +94,7 @@ class FirstTcpWatchdogTest {
             val watch = watchdog()
             watch.startSessionSent(0)
             if (success) watch.sessionEstablished() else watch.terminate()
-            now = 60_000
+            now = budget
             timer!!()
             assertEquals(0, failures)
         }

@@ -46,4 +46,48 @@ class CarPlayBonjourFallbackTest {
         assertTrue(bound.isEmpty())
         assertEquals(addresses, failures)
     }
+
+    /** The port held by the previous instance's close frees within the retry budget: bind succeeds. */
+    @Test fun anAllFailedBindRetriesUntilThePortIsFree() {
+        val delays = mutableListOf<Long>()
+        var calls = 0
+        val bound = bindMdnsWithRetry(
+            maxAttempts = 4,
+            retryDelayMillis = 750L,
+            sleep = { delays += it },
+            attempt = {
+                calls += 1
+                if (calls < 3) emptyList() else listOf("bound")
+            },
+        )
+        assertEquals(listOf("bound"), bound)
+        assertEquals(3, calls)
+        assertEquals(listOf(750L, 750L), delays)
+    }
+
+    @Test fun anAllFailedBindGivesUpAfterTheAttemptBudget() {
+        val delays = mutableListOf<Long>()
+        val bound = bindMdnsWithRetry<String>(
+            maxAttempts = 4,
+            retryDelayMillis = 750L,
+            sleep = { delays += it },
+            attempt = { emptyList() },
+        )
+        assertTrue(bound.isEmpty())
+        assertEquals("no delay precedes the first attempt", listOf(750L, 750L, 750L), delays)
+    }
+
+    @Test fun aFirstAttemptSuccessDoesNotRetry() {
+        val delays = mutableListOf<Long>()
+        var calls = 0
+        val bound = bindMdnsWithRetry(
+            maxAttempts = 4,
+            retryDelayMillis = 750L,
+            sleep = { delays += it },
+            attempt = { calls += 1; listOf("bound") },
+        )
+        assertEquals(listOf("bound"), bound)
+        assertEquals(1, calls)
+        assertTrue(delays.isEmpty())
+    }
 }

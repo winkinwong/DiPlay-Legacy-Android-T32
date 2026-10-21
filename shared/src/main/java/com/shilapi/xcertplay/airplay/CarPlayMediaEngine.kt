@@ -1,6 +1,7 @@
 package com.shilapi.xcertplay.airplay
 
 import android.util.Log
+import com.shilapi.xcertplay.network.WirelessLinkHealthMonitor
 import com.shilapi.xcertplay.transport.BlockingDuplexByteStream
 import java.io.Closeable
 import java.io.File
@@ -34,6 +35,9 @@ interface MediaSink {
     fun onAudioStopped(id: AudioStreamId) {}
     fun onMicrophoneStarted(id: AudioStreamId, config: MicrophoneConfig) {}
     fun onMicrophoneStopped(id: AudioStreamId) {}
+    /** duckAudio/unduckAudio: lower the MEDIA stream while guidance speaks, then restore. */
+    fun duckMedia(durationMs: Long, volume: Float) {}
+    fun unduckMedia() {}
     fun onIapMessage(bytes: ByteArray) {}
 }
 
@@ -101,6 +105,12 @@ class CarPlayMediaEngine(
     }
     /** Test seam: production uses [SCREEN_REAP_GRACE_MILLIS]. */
     internal var screenReapGraceMillis: Long = SCREEN_REAP_GRACE_MILLIS
+    /**
+     * The sessionscope link health monitor, or null when there is none (wired, tests). A stall
+     * line names the symptom; the monitor's counters and radio level name the cause, so the stall
+     * reporter carries them instead of leaving the report to guess.
+     */
+    var linkHealthProvider: () -> WirelessLinkHealthMonitor? = { null }
 
     private class BufferedStream(val stream: BufferedAudioStream, val connectionId: Any?)
 
@@ -129,6 +139,27 @@ class CarPlayMediaEngine(
         iapTunnelHandler = handler
     }
 
+    /**
+     * A silent sender gets the same keyframe nudge as the decoder recovery handler; the stream
+     * itself stays open because the iPhone does not re-SETUP it. The stall line also carries the
+     * link health snapshot: if the wlan counters kept moving and the radio level stayed put, the
+     * receive path was alive and the sender is what stopped; if the radio went quiet, look at the
+     * air, not the decoder.
+     */
+    internal fun handleReceiveStall(session: AirPlaySession, type: Int, screen: ScreenStream, millis: Long) {
+        if (streams[StreamKey(session, type)] !== screen) return
+        val command = if (type == STREAM_TYPE_ALT_SCREEN) {
+            mapOf("type" to "forceKeyFrame", "params" to mapOf("uuid" to AirPlayInfoPlist.ALT_UUID))
+        } else {
+            mapOf("type" to "forceKeyFrame")
+        }
+        val sent = session.sendCommand(command)
+        session.logDebug("Video recovery: receive stalled ${millis}ms; requested keyframe sent=$sent")
+        runCatching { linkHealthProvider()?.stallSnapshot() }
+            .getOrNull()
+            ?.let { session.logDebug("Video recovery: stall link state $it") }
+    }
+
     override fun onScreen(session: AirPlaySession, type: Int, stream: Map<String, Any?>): Int? {
         val key = outputKey(session, stream) ?: return null
         val streamKey = StreamKey(session, type)
@@ -154,16 +185,7 @@ class CarPlayMediaEngine(
             object : ScreenStream.Listener by currentScreenListener(type, sink, isCurrent = { streams[streamKey] === screen }) {
                 override fun onReceiveStall(millis: Long) {
                     if (streams[streamKey] !== screen) return
-                    // A silent sender gets the same keyframe nudge as the
-                    // decoder recovery handler; the stream itself stays
-                    // open because the iPhone does not re-SETUP it.
-                    val command = if (type == STREAM_TYPE_ALT_SCREEN) {
-                        mapOf("type" to "forceKeyFrame", "params" to mapOf("uuid" to AirPlayInfoPlist.ALT_UUID))
-                    } else {
-                        mapOf("type" to "forceKeyFrame")
-                    }
-                    val sent = session.sendCommand(command)
-                    session.logDebug("Video recovery: receive stalled ${millis}ms; requested keyframe sent=$sent")
+                    handleReceiveStall(session, type, screen, millis)
                 }
 
                 override fun onClosed(cause: Throwable?) {
@@ -514,6 +536,14 @@ class CarPlayMediaEngine(
             entry
         } + listOfNotNull(buffered?.let { it.stream.feedback(session.syncedNtp(), it.connectionId) })
         return linkedMapOf("streams" to streams)
+    }
+
+    override fun onDuckAudio(durationMs: Long, volume: Float) {
+        sink.duckMedia(durationMs, volume)
+    }
+
+    override fun onUnduckAudio() {
+        sink.unduckMedia()
     }
 
     override fun onTeardown(session: AirPlaySession, type: Int) {
