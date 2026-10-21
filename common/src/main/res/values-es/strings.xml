@@ -380,6 +380,7 @@
     <string name="floating_dot">Punto flotante</string>
     <string name="floating_dot_description">Muestra un punto flotante arrastrable; tócalo para abrir DiPlay (para unidades que no pueden añadir accesos directos en el escritorio)</string>
     <string name="waiting_for_iphone_over_usb">Esperando iPhone por USB</string>
+    <string name="waiting_for_iphone_to_join_wifi">Esperando a que el iPhone se una al Wi‑Fi; puede tardar hasta medio minuto</string>
     <string name="waiting_for_mfi_coprocessor">Esperando al coprocesador MFi</string>
     <string name="waiting_for_paired_iphone">Esperando al iPhone — toca DiPlay en Ajustes del iPhone > General > CarPlay</string>
     <string name="wi_fi_direct_is_still_busy_close_the_other_projection_app">Wi-Fi Direct sigue ocupado. Cierra la otra aplicación de proyección e inténtalo de nuevo.</string>

@@ -69,8 +69,20 @@ class DiPlaySessionService : Service() {
     override fun onTaskRemoved(rootIntent: Intent?) {
         // BYD's recents force-stops the package ~10 ms after removing the task: end guidance first.
         com.shilapi.xcertplay.hud.BydNavigationOutputs.endNow()
-        CarPlayBackgroundSession.stop()
-        stopSelf()
+        val byd = CarHotspotSetup.isBydHeadUnit(this)
+        val action = TaskRemovalPolicy.actionFor(byd)
+        // Into the report (connectionDiagnostic also reaches logcat): the HSAE NTDA3 removes the
+        // task every ~30 s while driving, so the next report must show which policy each removal ran.
+        CarPlayBackgroundSession.snapshot()?.controller?.sessionDiagnostic(
+            "task-removal policy byd=$byd action=$action sessionActive=${CarPlayBackgroundSession.hasSession()} " +
+                "root=${rootIntent?.component?.className ?: "none"}",
+        )
+        // Only BYD force-stops on task removal; elsewhere the process survives, so the session stays
+        // alive behind this service and the next launch reattaches in ~1 s instead of a full reconnect.
+        if (action == TaskRemovalPolicy.Action.TEAR_DOWN) {
+            CarPlayBackgroundSession.stop()
+            stopSelf()
+        }
     }
     companion object {
         const val ACTION_STOP = "com.shihab.diplay.DISCONNECT"

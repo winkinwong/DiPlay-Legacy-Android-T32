@@ -1,8 +1,11 @@
 package com.shilapi.xcertplay
 
 import android.annotation.SuppressLint
+import android.app.KeyguardManager
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.graphics.PixelFormat
 import android.os.Build
 import android.provider.Settings
@@ -25,6 +28,20 @@ object FloatingDotOverlay {
     private var dotView: View? = null
     private var windowManager: WindowManager? = null
 
+    /** CarPlay is on screen: the dot must not sit on top of the projection. */
+    private var suppressedByCarPlay = false
+    /** Screen is off or the keyguard is up: the dot must not appear over the lock screen. */
+    private var suppressedByScreen = false
+    private var screenReceiver: BroadcastReceiver? = null
+
+    /** The one visibility decision, kept pure so it can be tested. */
+    internal fun shouldShowDot(
+        enabled: Boolean,
+        permitted: Boolean,
+        carPlayVisible: Boolean,
+        screenSuppressed: Boolean,
+    ): Boolean = enabled && permitted && !carPlayVisible && !screenSuppressed
+
     fun permitted(context: Context): Boolean {
         return if (Build.VERSION.SDK_INT >= 23) {
             Settings.canDrawOverlays(context)
@@ -36,19 +53,88 @@ object FloatingDotOverlay {
     fun isShowing(): Boolean = dotView != null
 
     fun setEnabled(context: Context, enabled: Boolean) {
-        AirPlayPersistence.saveFloatingDot(context, enabled)
-        if (enabled) show(context.applicationContext)
-        else hide()
+        val app = context.applicationContext
+        AirPlayPersistence.saveFloatingDot(app, enabled)
+        if (enabled) {
+            ensureScreenReceiver(app)
+            refresh(app)
+        } else {
+            suppressedByScreen = false
+            unregisterScreenReceiver(app)
+            hide()
+        }
     }
 
     fun isEnabled(context: Context): Boolean = AirPlayPersistence.loadFloatingDot(context)
 
+    /**
+     * CarPlay is in front (or no longer is). CarPlayHostActivity's lifecycle drives this so the dot
+     * never draws over the projection — one of the reported complaints.
+     */
+    fun setCarPlayVisible(context: Context, visible: Boolean) {
+        suppressedByCarPlay = visible
+        refresh(context.applicationContext)
+    }
+
     /** App 启动时调用，按用户设置恢复小白点。 */
     fun restoreIfEnabled(context: Context) {
-        if (isEnabled(context) && permitted(context)) {
-            show(context.applicationContext)
+        val app = context.applicationContext
+        if (isEnabled(app)) {
+            ensureScreenReceiver(app)
+            refresh(app)
         }
     }
+
+    /** Shows the dot only when it is enabled and neither CarPlay nor the lock screen owns it. */
+    private fun refresh(context: Context) {
+        if (shouldShowDot(isEnabled(context), permitted(context), suppressedByCarPlay, suppressedByScreen)) {
+            show(context)
+        } else {
+            hide()
+        }
+    }
+
+    private fun ensureScreenReceiver(context: Context) {
+        if (screenReceiver != null) return
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(ctx: Context, intent: Intent) {
+                when (intent.action) {
+                    Intent.ACTION_SCREEN_OFF -> {
+                        suppressedByScreen = true
+                        hide()
+                    }
+                    // Stay hidden while the keyguard is up; reappear at once when there is none.
+                    Intent.ACTION_SCREEN_ON -> {
+                        suppressedByScreen = keyguardLocked(ctx)
+                        refresh(ctx.applicationContext)
+                    }
+                    Intent.ACTION_USER_PRESENT -> {
+                        suppressedByScreen = false
+                        refresh(ctx.applicationContext)
+                    }
+                }
+            }
+        }
+        runCatching {
+            context.registerReceiver(receiver, IntentFilter().apply {
+                addAction(Intent.ACTION_SCREEN_OFF)
+                addAction(Intent.ACTION_SCREEN_ON)
+                addAction(Intent.ACTION_USER_PRESENT)
+            })
+        }.onSuccess { screenReceiver = receiver }
+            .onFailure { e -> Log.w(TAG, "screen receiver not registered", e) }
+    }
+
+    private fun unregisterScreenReceiver(context: Context) {
+        val receiver = screenReceiver ?: return
+        screenReceiver = null
+        runCatching { context.unregisterReceiver(receiver) }
+            .onFailure { e -> Log.w(TAG, "screen receiver not unregistered", e) }
+    }
+
+    private fun keyguardLocked(context: Context): Boolean = runCatching {
+        (context.getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager)?.isKeyguardLocked == true
+    }.getOrDefault(false)
 
     @SuppressLint("ClickableViewAccessibility")
     fun show(context: Context) {

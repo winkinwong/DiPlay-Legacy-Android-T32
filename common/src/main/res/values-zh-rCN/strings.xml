@@ -394,6 +394,7 @@
     <string name="vpn_consent_launch_failed">VPN 授权窗口不可用，正在尝试直接连接</string>
     <string name="vpn_consent_unavailable">此车机无法授予 VPN 权限（系统 VPN 确认组件缺失）。有线 CarPlay 需要 VPN，请检查系统更新或更换 ROM。</string>
     <string name="waiting_for_iphone_over_usb">正在等待 USB 连接的 iPhone</string>
+    <string name="waiting_for_iphone_to_join_wifi">正在等待 iPhone 接入 Wi‑Fi，最长可能需要半分钟</string>
     <string name="waiting_for_mfi_coprocessor">正在等待 MFi 协处理器</string>
     <string name="waiting_for_paired_iphone">正在等待 iPhone — 请在 iPhone 设置 > 通用 > CarPlay 里点 DiPlay</string>
     <string name="wi_fi_direct_is_still_busy_close_the_other_projection_app">Wi-Fi Direct 仍被占用。请关闭其他投屏应用后重试。</string>
