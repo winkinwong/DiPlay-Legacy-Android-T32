@@ -9,6 +9,13 @@ class DiPlayApplication : MultiDexApplication() {
     override fun onCreate() {
         super.onCreate()
         setupCrashHandler()
+        ProcessVitals.start(this)
+    }
+
+    /** LMK evidence: a trim shortly before the log goes silent is what a system kill looks like. */
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        ProcessVitals.recordTrim(this, level)
     }
 
     private fun setupCrashHandler() {

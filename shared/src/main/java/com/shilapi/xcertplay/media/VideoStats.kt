@@ -6,6 +6,8 @@ import android.util.Log
 internal class VideoStats(
     private val label: String = "",
     private val nanoTime: () -> Long = System::nanoTime,
+    /** Stream frame size; the quality flag judges bits per PIXEL, so the same bitrate at 100% is judged harsher. */
+    private val framePixels: Int = DEFAULT_FRAME_PIXELS,
 ) {
     private var windowStartNs = nanoTime()
     private var lastArrivalNs = 0L
@@ -65,6 +67,19 @@ internal class VideoStats(
         return " decode p50=%dms p90=%dms late=%d".format(p50, percentileMs(90), late) + delay + hint
     }
 
+    /**
+     * The iPhone adapts its encode quality on its own (measured 2026-10-21: bits per frame swing 4-5x at a
+     * CONSTANT 768x432 stream, 30% of smooth windows visibly blurry). This field makes that visible: a
+     * window below [BLUR_BITS_PER_PIXEL] is the "the picture went soft" the driver reports, and a report can
+     * align it with stalls and recovery bursts instead of guessing.
+     */
+    private fun qualitySummary(): String {
+        if (rendered == 0 || framePixels <= 0) return ""
+        val bitsPerPixel = bytes * 8.0 / rendered / framePixels
+        val quality = if (bitsPerPixel < BLUR_BITS_PER_PIXEL) "blur" else "ok"
+        return " bitsPerFrame=%.1f quality=%s".format(bytes * 8.0 / rendered / 1024, quality)
+    }
+
     @Synchronized fun logIfDue(): String? {
         val now = nanoTime()
         val elapsedNs = now - windowStartNs
@@ -77,7 +92,7 @@ internal class VideoStats(
             received / seconds, rendered / seconds, maxArrivalGapNs / 1_000_000,
             (bytes * 8 / 1000 / seconds).toLong(), recoveries,
             touchAvgMs, maxTouchLatencyNs / 1_000_000, touchSamples, TouchLatencyProbe.maxSendNs / 1_000_000,
-        ) + decodeSummary()
+        ) + decodeSummary() + qualitySummary()
         TouchLatencyProbe.resetMaxSendNs()
         Log.i(TAG, line)
         windowStartNs = now
@@ -93,5 +108,12 @@ internal class VideoStats(
         const val IDLE_GAP_NS = 2_000_000_000L // longer gaps are a static screen, not lag
         /** 24 fps frame budget: a slower decoder stutters at every offered frame rate. */
         private const val DECODE_BUDGET_MILLIS_24FPS = 40
+        /** 768x432 — the X-Trail's 60% stream; a fallback when the caller does not pass the real size. */
+        const val DEFAULT_FRAME_PIXELS = 768 * 432
+        /**
+         * 12 kbit/frame at 768x432 (the 2026-10-21 field boundary between "clear" and "visibly soft"
+         * windows at a constant resolution), expressed per pixel so 1280x720 is judged by the same yardstick.
+         */
+        const val BLUR_BITS_PER_PIXEL = 12 * 1024.0 / (768 * 432)
     }
 }
