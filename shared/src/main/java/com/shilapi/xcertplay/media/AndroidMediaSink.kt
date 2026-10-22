@@ -838,8 +838,13 @@ private class VideoDecoder(
     private var failureReports = 0
     private val referenceChain = VideoReferenceChain()
     private var lastKeyFrameRequestNs = 0L
+    /** Upstream #216: when the current wait for an acceptable keyframe began. */
+    private var keyframeWaitStartedNs = 0L
     // The main screen keeps the historical log format; other screens are labelled.
-    private val stats = VideoStats(statsLabel ?: if (streamType == MAIN_SCREEN_TYPE) "" else " stream=$streamType")
+    private val stats = VideoStats(
+        statsLabel ?: if (streamType == MAIN_SCREEN_TYPE) "" else " stream=$streamType",
+        framePixels = width * height,
+    )
     private val thread = Thread(::run, "carplay-video").apply { isDaemon = true }
 
     fun start() { thread.start() }
@@ -1145,9 +1150,21 @@ private class VideoDecoder(
         if (outputSurface == null) return
         if (annexB.isEmpty()) { recover("invalid video access unit"); return }
         if (!referenceChain.accepts(annexB, config.codec)) {
+            // Upstream #216: keyframe requests repeat while waiting, but if the chain tracker and
+            // the phone disagree about the reference state (or every keyframe arrives damaged on a
+            // lossy link), well-formed frames can be rejected forever without ever triggering a
+            // full reset — the picture froze at shown=0 for minutes while rx stayed healthy.
+            // Escalate a long wait to the same full recovery the stall paths use.
+            val nowNs = System.nanoTime()
+            if (keyframeWaitStartedNs == 0L) keyframeWaitStartedNs = nowNs
+            if (nowNs - keyframeWaitStartedNs >= KEYFRAME_WAIT_ESCALATION_NS) {
+                recover("keyframe wait exceeded ${KEYFRAME_WAIT_ESCALATION_NS / 1_000_000}ms")
+                return
+            }
             requestKeyFrameIfDue()
             return
         }
+        keyframeWaitStartedNs = 0L
         if (decoder == null) configureDecoder(config)
         val codec = decoder ?: return
         if (!submittedFrameLogged) {
@@ -1203,6 +1220,7 @@ private class VideoDecoder(
         // Recreate with codec-specific data: flush can discard CSD before the first output.
         releaseDecoder()
         referenceChain.reset()
+        keyframeWaitStartedNs = 0L
         requestKeyFrameIfDue()
     }
 
@@ -1321,6 +1339,8 @@ private class VideoDecoder(
         const val SENDER_PAUSE_NS = 120_000_000L
         // Frames before a pause that wait for it: the decoder holds about two, sometimes three.
         const val PAUSE_HELD_FRAMES = 3
+        /** Upstream #216: a keyframe wait longer than this escalates to a full recovery. */
+        const val KEYFRAME_WAIT_ESCALATION_NS = 5_000_000_000L
         val START_CODE = byteArrayOf(0x00, 0x00, 0x00, 0x01)
     }
 }

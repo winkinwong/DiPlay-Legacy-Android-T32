@@ -8,7 +8,10 @@ import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.SocketTimeoutException
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
 enum class VideoCodec { H264, H265 }
@@ -56,13 +59,68 @@ class ScreenStream(
     internal var stallReportMillis: Long = STALL_REPORT_MILLIS
     /** Test seam: production uses [STALL_REPORT_INTERVAL_MILLIS]. */
     internal var stallReportIntervalMillis: Long = STALL_REPORT_INTERVAL_MILLIS
+    /** Test seam: the decrypt worker awaits this before each frame; production leaves it null. */
+    internal var decryptGate: (() -> Unit)? = null
     /** Receive-thread owned: when the last payload finished arriving. */
     private var lastPayloadNanos = 0L
     /** Receive-thread owned: the last reported stall duration. */
     private var lastStallReportMillis = 0L
 
+    /**
+     * Port of upstream #249/#288: on slow-decrypt hardware (the X-Trail's i.MX6 decrypts at
+     * ~1.9 MB/s measured) an inline decrypt stalls the socket receive loop, so frames arrive late
+     * and a burst fills the decode queue, whose overflow drops shatter the H.264 reference chain
+     * — mosaic blocks and a frozen picture while rx stays healthy. Video frames now go through
+     * this queue to a dedicated decrypt thread; the receive loop only enqueues. When the queue is
+     * full the receive loop waits briefly for a slot instead of dropping: the loop stalls, TCP
+     * backpressure paces the iPhone, and spikes degrade into latency rather than lost frames.
+     */
+    private data class PendingFrame(
+        val header: ByteArray,
+        val body: ByteArray,
+        val stats: StreamReceiveStats,
+        val arrivalNanos: Long,
+        /** Captured at reception time so a dropped frame never corrupts later frames' decryption. */
+        val frameNonce: Long,
+    )
+    private val decryptQueue = LinkedBlockingQueue<PendingFrame>(DECRYPT_QUEUE_CAPACITY)
+    @Volatile private var decryptThread: Thread? = null
+    private val droppedFrames = AtomicLong(0)
+    private val decryptFailures = AtomicInteger(0)
+
+    private fun startDecryptWorker() {
+        if (decryptThread != null) return
+        decryptThread = Thread({ decryptLoop() }, "airplay-screen-decrypt").apply {
+            isDaemon = true
+            start()
+        }
+    }
+
+    private fun decryptLoop() {
+        while (!closed.get()) {
+            val pending = try {
+                decryptQueue.take()
+            } catch (_: InterruptedException) {
+                break
+            }
+            try {
+                decryptGate?.invoke()
+                decryptAndDeliver(pending)
+            } catch (error: Exception) {
+                // decryptAndDeliver handles per-frame auth failures; anything escaping here is
+                // stream-level (the consecutive-failure cap).
+                if (!closed.get()) {
+                    Log.e(TAG, "video decrypt worker failed", error)
+                    listener.onClosed(error)
+                    return
+                }
+            }
+        }
+    }
+
     fun listen(listener: Listener): Int {
         this.listener = listener
+        startDecryptWorker()
         val bound = AirPlaySocketBinder.server(bindReference, "AirPlay screen")
         server = bound
         thread = Thread({ accept(bound) }, "airplay-screen").apply { isDaemon = true; start() }
@@ -74,6 +132,8 @@ class ScreenStream(
         safeClose(socket)
         safeClose(server)
         thread?.interrupt()
+        decryptThread?.interrupt()
+        decryptQueue.clear()
     }
 
     private fun accept(bound: ServerSocket) {
@@ -122,24 +182,32 @@ class ScreenStream(
     private fun onMessage(header: ByteArray, body: ByteArray, stats: StreamReceiveStats, arrivalNanos: Long) {
         when (header[OPCODE_OFFSET].toInt() and 0xff) {
             OP_VIDEO_FRAME -> {
-                val payload = if (body.size >= ScreenCodec.TAG_SIZE) {
-                    val start = System.nanoTime()
-                    ScreenCodec.decryptFrame(key, frameCounter.get(), header, body)
-                        .also {
-                            stats.decrypted(System.nanoTime() - start, body.size)
-                            frameCounter.incrementAndGet()
-                        }
-                } else {
-                    body
-                }
-                if (firstFrameLogged.compareAndSet(false, true)) {
-                    Log.i(
-                        TAG,
-                        "video first decrypted frame sealed=${body.size} plain=${payload.size} " +
-                        "head=${payload.hexPrefix(16)} chacha=${AirPlayCrypto.chachaImplementation}",
+                // Every received video frame advances the ChaCha nonce by 1. The nonce is captured
+                // at reception time so each frame keeps its exact nonce regardless of worker queue
+                // depth, delays, or drops (upstream #249).
+                val frameNonce = frameCounter.getAndIncrement()
+                // Upstream #288: a plain offer() drops the frame the moment the queue is full. On
+                // units whose software decryption is barely as fast as the stream, one slow frame
+                // (GC/JIT spikes reach 300 ms+) fills the 10-frame queue and the overflow drops
+                // shatter the reference chain. Wait briefly for a slot instead: the receive loop
+                // stalls, TCP backpressure paces the phone, and spikes degrade into latency rather
+                // than lost frames. Sustained overload still drops after the wait, and the nonce
+                // was already captured, so a drop never corrupts later frames' decryption.
+                val queued = try {
+                    decryptQueue.offer(
+                        PendingFrame(header, body, stats, arrivalNanos, frameNonce),
+                        DECRYPT_QUEUE_OFFER_WAIT_MILLIS, TimeUnit.MILLISECONDS,
                     )
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    false
                 }
-                listener.onFrame(ScreenCodec.lengthPrefixedToAnnexB(payload), ScreenCodec.senderNanos(header), arrivalNanos)
+                if (!queued) {
+                    val dropped = droppedFrames.incrementAndGet()
+                    if (dropped == 1L || dropped % 60L == 0L) {
+                        onDiagnostic("video decrypt queue full; dropped frames=$dropped")
+                    }
+                }
             }
             OP_VIDEO_CONFIG -> {
                 val (codec, codecData) = ScreenCodec.detectConfig(body)
@@ -148,6 +216,44 @@ class ScreenStream(
                 listener.onConfig(codecData)
             }
         }
+    }
+
+    /** Decrypts one queued video frame and delivers it; runs on the decrypt worker thread. */
+    private fun decryptAndDeliver(pending: PendingFrame) {
+        val header = pending.header
+        val body = pending.body
+        val stats = pending.stats
+        val arrivalNanos = pending.arrivalNanos
+        val payload = if (body.size >= ScreenCodec.TAG_SIZE) {
+            val start = System.nanoTime()
+            try {
+                ScreenCodec.decryptFrame(key, pending.frameNonce, header, body)
+                    .also {
+                        stats.decrypted(System.nanoTime() - start, body.size)
+                        decryptFailures.set(0)
+                    }
+            } catch (error: Exception) {
+                // A single corrupt frame (transit bit error, upstream #180) must not kill the whole
+                // screen stream: the per-frame nonce is already assigned, so skipping this frame
+                // keeps us in sync with the iPhone and the stream survives. A systematic desync
+                // still fails every frame, so cap consecutive skips as before.
+                val consecutive = decryptFailures.incrementAndGet()
+                Log.w(TAG, "video frame auth failed, skipping frame (consecutive=$consecutive, nonce=${pending.frameNonce})", error)
+                onDiagnostic("video frame auth failed, skipped consecutive=$consecutive")
+                if (consecutive >= MAX_CONSECUTIVE_DECRYPT_FAILURES) throw error
+                return
+            }
+        } else {
+            body
+        }
+        if (firstFrameLogged.compareAndSet(false, true)) {
+            Log.i(
+                TAG,
+                "video first decrypted frame sealed=${body.size} plain=${payload.size} " +
+                    "head=${payload.hexPrefix(16)} chacha=${AirPlayCrypto.chachaImplementation}",
+            )
+        }
+        listener.onFrame(ScreenCodec.lengthPrefixedToAnnexB(payload), ScreenCodec.senderNanos(header), arrivalNanos)
     }
 
     private fun readFully(input: InputStream, length: Int): ByteArray? {
@@ -205,6 +311,15 @@ class ScreenStream(
         const val STALL_REPORT_MILLIS = 2_000L
         /** At most one stall report per interval. */
         const val STALL_REPORT_INTERVAL_MILLIS = 1_000L
+        /**
+         * Consecutive corrupt video frames tolerated before giving up: a transient error skips
+         * one frame, a systematic nonce/key desync still ends the stream (upstream #180).
+         */
+        const val MAX_CONSECUTIVE_DECRYPT_FAILURES = 30
+        /** Bounded decrypt backlog (upstream #249): at 30 fps this is ~0.3 s of video. */
+        const val DECRYPT_QUEUE_CAPACITY = 10
+        /** How long the receive loop waits for a decrypt slot before dropping a frame (#288). */
+        const val DECRYPT_QUEUE_OFFER_WAIT_MILLIS = 120L
     }
 }
 
