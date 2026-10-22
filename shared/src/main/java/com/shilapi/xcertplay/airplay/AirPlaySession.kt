@@ -581,8 +581,9 @@ class AirPlaySession(
                     }
                     debugLog("airplay /info request=$requestInfo")
                 }
-                Log.i(
-                    TAG,
+                // Must reach the exported report: the wireless audio question ("why does the iPhone
+                // never open an audio stream?") is answered by what we advertised vs what it asked.
+                debugLog(
                     "airplay /info features=${info["features"]} " +
                         "audioFormats=${(info["audioFormats"] as? List<*>)?.size ?: 0} " +
                         "audioLatencies=${(info["audioLatencies"] as? List<*>)?.size ?: 0}",
@@ -648,6 +649,9 @@ class AirPlaySession(
             return RtspMessage.Response(status = 400)
         }
         debugLog("airplay SETUP keys=${dict.keys.sorted()}")
+        // The proposed feature list is the iPhone's half of the audio negotiation; keys alone cannot
+        // show whether it asked for audio at all. Kept free of payload= so the report redactor keeps it.
+        dict["features"]?.let { debugLog("airplay SETUP proposed features=$it") }
         val streams = dict["streams"] as? List<*>
         if (streams != null) {
             val responseStreams = handleStreams(streams)
@@ -683,6 +687,7 @@ class AirPlaySession(
             response["keepAlivePort"] = openKeepAlive()
         }
         val features = setupEnabledFeatures(config, dict["features"] as? List<*>)
+        debugLog("airplay SETUP enabled features=$features")
         val videoPlaybackEnabled = VideoInCar.FEATURE in features
         val videoDelivery = videoPlaybackAvailability.setFeatureEnabled(videoPlaybackEnabled)
         debugLog("airplay video playback negotiated=$videoPlaybackEnabled availability=$videoDelivery")
@@ -695,10 +700,16 @@ class AirPlaySession(
 
     private fun handleStreams(streams: List<*>): List<Any?> {
         val result = arrayListOf<Any?>()
+        // Redaction-safe: the report must show which stream types the iPhone proposed, while the
+        // per-stream payload line below is dropped by the redactor (it carries "payload=").
+        debugLog(
+            "airplay SETUP streams proposed=" +
+                streams.mapNotNull { asMap(it)?.get("type")?.let(::long)?.toInt() },
+        )
         for (entry in streams) {
             val stream = asMap(entry) ?: continue
             val type = long(stream["type"])?.toInt() ?: continue
-            debugLog("airplay SETUP stream type=$type payload=$stream")
+            debugLog("airplay SETUP stream type=$type")
             when (type) {
                 STREAM_TYPE_MAIN_SCREEN, STREAM_TYPE_ALT_SCREEN -> {
                     val port = media.onScreen(this, type, stream)
