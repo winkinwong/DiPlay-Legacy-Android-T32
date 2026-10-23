@@ -93,6 +93,41 @@ class AudioDuckTest {
         assertEquals("the replaced timer must not restore twice", listOf(0.5f, 0.25f, 1f), volumes(media))
     }
 
+    /**
+     * The iPhone sends duckAudio with volume=0.0 (measured 45/45 times on the 2026-10-22 USB
+     * session). Applying 0.0 silences the music for the whole announcement, which the driver
+     * hears as "the music stutters during guidance" instead of "the music was lowered".
+     * A zero request must clamp to [DUCK_FLOOR] so music stays audible underneath.
+     */
+    @Test fun aZeroVolumeRequestDucksToTheFloorInsteadOfSilence() {
+        val coordinator = coordinator()
+        val media = track()
+        coordinator.acquire(media, AudioChannel.MEDIA, attributes)
+        coordinator.duckMedia(500, 0f)
+        assertEquals(
+            "volume=0 must duck to the audible floor, never to silence",
+            listOf(AudioFocusCoordinator.DUCK_FLOOR),
+            volumes(media),
+        )
+        assertTrue("the floor must stay audible", AudioFocusCoordinator.DUCK_FLOOR > 0f)
+        coordinator.unduckMedia()
+        assertEquals(listOf(AudioFocusCoordinator.DUCK_FLOOR, 1f), volumes(media))
+    }
+
+    /** A volume below the floor is lifted to it; a higher one is honoured as asked. */
+    @Test fun onlySubFloorVolumesAreRaisedToTheFloor() {
+        val coordinator = coordinator()
+        val media = track()
+        coordinator.acquire(media, AudioChannel.MEDIA, attributes)
+        coordinator.duckMedia(500, 0.05f)
+        coordinator.duckMedia(500, 0.6f)
+        assertEquals(
+            "0.05 clamps to the floor, 0.6 is kept",
+            listOf(AudioFocusCoordinator.DUCK_FLOOR, 0.6f),
+            volumes(media),
+        )
+    }
+
     private fun coordinator(enabled: Boolean = true, autoYield: Boolean = true) =
         AudioFocusCoordinator(context, enabled, autoYield).also(coordinators::add)
     private fun track(): AudioTrack = AudioTrack.Builder().setAudioAttributes(attributes)

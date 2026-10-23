@@ -201,15 +201,23 @@ internal class AudioFocusCoordinator(
      * duckAudio from the iPhone: lower the MEDIA stream at once, restore the
      * pre-duck volume when [durationMs] elapses or [unduckMedia] arrives.
      * Navigation guidance never enters this map, so it stays at full volume.
+     *
+     * The iPhone asks for volume=0.0 on this head unit (measured 45/45 ducks on the 2026-10-22
+     * USB session): applying it literally silences the music for the whole announcement, which
+     * the driver reports as "the music stutters during guidance". A request at or below
+     * [DUCK_FLOOR] is therefore raised to it — the music must stay audible under the guidance,
+     * which is what "duck" means, not a hard mute.
      */
     fun duckMedia(durationMs: Long, volume: Float) {
         if (volumeBeforeDuck == null) volumeBeforeDuck = mediaVolume
         duckRestore?.let(duckHandler::removeCallbacks)
         duckRestore = null
-        val ducked = volume.coerceIn(0f, 1f)
+        val ducked = volume.coerceIn(DUCK_FLOOR, 1f)
         setMediaVolume(ducked)
         // Say duck ran and what it acted on: a silent no-op (no media track) must be visible.
-        runCatching { report("Audio: duck volume=$ducked restoreIn=${durationMs}ms activeTracks=${active.size}") }
+        runCatching {
+            report("Audio: duck volume=$ducked requested=$volume restoreIn=${durationMs}ms activeTracks=${active.size}")
+        }
         if (durationMs > 0) {
             val restore = Runnable {
                 duckRestore = null
@@ -237,10 +245,17 @@ internal class AudioFocusCoordinator(
         AudioChannel.NAVIGATION -> 0
     }
 
-    private companion object {
-        const val TAG = "DiPlay-AudioFocus"
-        const val FULL_VOLUME = 1f
-        const val DUCKED_VOLUME = 0.2f
+    companion object {
+        /**
+         * Lowest media gain a duckAudio request may produce. The iPhone asks for 0.0 on this head
+         * unit; honouring it silences the music for the whole announcement, which reads as a
+         * stutter rather than a duck. 20% keeps the music audible underneath the guidance.
+         */
+        const val DUCK_FLOOR = 0.2f
+
+        private const val TAG = "DiPlay-AudioFocus"
+        private const val FULL_VOLUME = 1f
+        private const val DUCKED_VOLUME = 0.2f
     }
 }
 
