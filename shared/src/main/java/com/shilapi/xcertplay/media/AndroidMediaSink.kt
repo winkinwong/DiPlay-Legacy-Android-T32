@@ -30,6 +30,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
+import kotlin.math.pow
 import java.util.concurrent.TimeUnit
 
 internal fun audioTrackAttributesForFocus(track: AudioTrack, configured: AudioAttributes): AudioAttributes =
@@ -198,35 +199,47 @@ internal class AudioFocusCoordinator(
     private val duckHandler by lazy { Handler(Looper.getMainLooper()) }
 
     /**
-     * duckAudio from the iPhone: lower the MEDIA stream at once, restore the
-     * pre-duck volume when [durationMs] elapses or [unduckMedia] arrives.
-     * Navigation guidance never enters this map, so it stays at full volume.
+     * duckAudio from the iPhone: lower the MEDIA stream at once and restore it when [unduckMedia]
+     * arrives. Navigation guidance never enters this map, so it stays at full volume.
      *
-     * The iPhone asks for volume=0.0 on this head unit (measured 45/45 ducks on the 2026-10-22
-     * USB session): applying it literally silences the music for the whole announcement, which
-     * the driver reports as "the music stutters during guidance". A request at or below
-     * [DUCK_FLOOR] is therefore raised to it — the music must stay audible under the guidance,
-     * which is what "duck" means, not a hard mute.
+     * [durationMs] is a FLOOR, not a deadline. Measured 2026-10-23: the iPhone sends
+     * durationMs=500 while its own unduckAudio only arrives 5-9 s later, after the announcement.
+     * Restoring at the requested duration made the music jump back to full volume in the middle
+     * of the announcement. The request stays in force until unduck; [DUCK_SAFETY_MAX_MILLIS]
+     * only exists so a lost unduck cannot leave the music quiet forever.
+     *
+     * [volume] is the level the iPhone asked for. It sends DECIBELS (-13.98 measured), so a
+     * negative value is converted to linear gain before clamping; a 0..1 value is used as is.
      */
     fun duckMedia(durationMs: Long, volume: Float) {
         if (volumeBeforeDuck == null) volumeBeforeDuck = mediaVolume
         duckRestore?.let(duckHandler::removeCallbacks)
         duckRestore = null
-        val ducked = volume.coerceIn(DUCK_FLOOR, 1f)
+        val ducked = requestedGain(volume).coerceIn(DUCK_FLOOR, 1f)
         setMediaVolume(ducked)
         // Say duck ran and what it acted on: a silent no-op (no media track) must be visible.
         runCatching {
-            report("Audio: duck volume=$ducked requested=$volume restoreIn=${durationMs}ms activeTracks=${active.size}")
+            report("Audio: duck volume=$ducked requested=$volume requestedMs=$durationMs activeTracks=${active.size}")
         }
-        if (durationMs > 0) {
-            val restore = Runnable {
-                duckRestore = null
-                volumeBeforeDuck?.let(::setMediaVolume)
-                volumeBeforeDuck = null
-            }
-            duckRestore = restore
-            duckHandler.postDelayed(restore, durationMs)
+        // Hold past the requested duration: unduck (or the ceiling) ends the duck.
+        val holdMillis = maxOf(durationMs, DUCK_SAFETY_MAX_MILLIS)
+        val restore = Runnable {
+            duckRestore = null
+            volumeBeforeDuck?.let(::setMediaVolume)
+            volumeBeforeDuck = null
+            runCatching { report("Audio: duck released by the ${DUCK_SAFETY_MAX_MILLIS}ms ceiling") }
         }
+        duckRestore = restore
+        duckHandler.postDelayed(restore, holdMillis)
+    }
+
+    /**
+     * The iPhone's duck level: negative values are decibels, 0..1 values are linear gains.
+     * -13.98 dB → about 0.20; anything else is clamped by the caller.
+     */
+    internal fun requestedGain(volume: Float): Float = when {
+        volume < 0f -> 10f.pow(volume / 20f)
+        else -> volume
     }
 
     fun unduckMedia() {
@@ -247,11 +260,18 @@ internal class AudioFocusCoordinator(
 
     companion object {
         /**
-         * Lowest media gain a duckAudio request may produce. The iPhone asks for 0.0 on this head
-         * unit; honouring it silences the music for the whole announcement, which reads as a
-         * stutter rather than a duck. 20% keeps the music audible underneath the guidance.
+         * Lowest media gain a duckAudio request may produce. iOS asks for about -14 dB on this
+         * head unit; honouring a deeper request would silence the music under the announcement,
+         * which reads as a stutter rather than a duck. 20% keeps the music audible underneath.
          */
         const val DUCK_FLOOR = 0.2f
+
+        /**
+         * Upper bound on how long a duck may hold without an unduck. The iPhone's own duration is
+         * honoured past its value (it announces for seconds while asking for 500 ms); this ceiling
+         * only guards against a lost unduck leaving the music quiet forever.
+         */
+        const val DUCK_SAFETY_MAX_MILLIS = 30_000L
 
         private const val TAG = "DiPlay-AudioFocus"
         private const val FULL_VOLUME = 1f

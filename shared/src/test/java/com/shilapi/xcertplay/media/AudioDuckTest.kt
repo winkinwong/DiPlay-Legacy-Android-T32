@@ -70,16 +70,24 @@ class AudioDuckTest {
         assertEquals(listOf(0.2f, 1f), volumes(media))
     }
 
-    @Test fun duckRestoresAfterItsDurationWithoutAnUnduckCommand() {
+    /**
+     * The requested duration is a floor: the duck outlives it while the announcement is still
+     * speaking, and only the safety ceiling releases it without an unduck.
+     */
+    @Test fun duckOutlivesItsRequestedDurationUntilTheSafetyCeiling() {
         val coordinator = coordinator()
         val media = track()
         coordinator.acquire(media, AudioChannel.MEDIA, attributes)
         coordinator.duckMedia(500, 0.3f)
         assertEquals(listOf(0.3f), volumes(media))
         shadowOf(Looper.getMainLooper()).idleFor(500, TimeUnit.MILLISECONDS)
-        assertEquals("duration elapsed, the pre-duck volume must return", listOf(0.3f, 1f), volumes(media))
+        assertEquals("the requested duration alone must not restore", listOf(0.3f), volumes(media))
+        shadowOf(Looper.getMainLooper())
+            .idleFor(AudioFocusCoordinator.DUCK_SAFETY_MAX_MILLIS, TimeUnit.MILLISECONDS)
+        assertEquals("the ceiling restores without an unduck", listOf(0.3f, 1f), volumes(media))
     }
 
+    /** A second duck replaces the pending release and keeps the original restore base. */
     @Test fun secondDuckKeepsTheOriginalRestoreBaseAndReplacesTheTimer() {
         val coordinator = coordinator()
         val media = track()
@@ -87,9 +95,10 @@ class AudioDuckTest {
         coordinator.duckMedia(2_000, 0.5f)
         coordinator.duckMedia(300, 0.25f)
         assertEquals(listOf(0.5f, 0.25f), volumes(media))
-        shadowOf(Looper.getMainLooper()).idleFor(300, TimeUnit.MILLISECONDS)
-        assertEquals("second duck restores to the pre-duck volume", listOf(0.5f, 0.25f, 1f), volumes(media))
-        shadowOf(Looper.getMainLooper()).idleFor(2_000, TimeUnit.MILLISECONDS)
+        coordinator.unduckMedia()
+        assertEquals("unduck restores the pre-duck volume", listOf(0.5f, 0.25f, 1f), volumes(media))
+        shadowOf(Looper.getMainLooper())
+            .idleFor(AudioFocusCoordinator.DUCK_SAFETY_MAX_MILLIS + 1, TimeUnit.MILLISECONDS)
         assertEquals("the replaced timer must not restore twice", listOf(0.5f, 0.25f, 1f), volumes(media))
     }
 
@@ -126,6 +135,55 @@ class AudioDuckTest {
             listOf(AudioFocusCoordinator.DUCK_FLOOR, 0.6f),
             volumes(media),
         )
+    }
+
+    /**
+     * The iPhone's durationMs is how long it asked for, not how long the announcement lasts:
+     * measured 2026-10-23, durationMs=500 arrives while the matching unduckAudio only arrives
+     * 5-9 s later. Restoring at the requested duration made the music jump back to full volume
+     * in the middle of the announcement ("ducked for an instant, then loud again").
+     */
+    @Test fun theRequestedDurationDoesNotEndTheDuckWhileUnduckIsStillComing() {
+        val coordinator = coordinator()
+        val media = track()
+        coordinator.acquire(media, AudioChannel.MEDIA, attributes)
+        coordinator.duckMedia(500, 0.2f)
+        assertEquals(listOf(0.2f), volumes(media))
+        // The announcement keeps speaking well past the requested 500 ms.
+        shadowOf(Looper.getMainLooper()).idleFor(3_000, TimeUnit.MILLISECONDS)
+        assertEquals(
+            "the duck must hold while the announcement is still speaking",
+            listOf(0.2f),
+            volumes(media),
+        )
+        coordinator.unduckMedia()
+        assertEquals("unduck ends the duck", listOf(0.2f, 1f), volumes(media))
+    }
+
+    /** A lost unduckAudio must not leave the music ducked forever. */
+    @Test fun aLostUnduckStillRestoresAtTheSafetyCeiling() {
+        val coordinator = coordinator()
+        val media = track()
+        coordinator.acquire(media, AudioChannel.MEDIA, attributes)
+        coordinator.duckMedia(500, 0.2f)
+        assertEquals(listOf(0.2f), volumes(media))
+        shadowOf(Looper.getMainLooper())
+            .idleFor(AudioFocusCoordinator.DUCK_SAFETY_MAX_MILLIS + 1, TimeUnit.MILLISECONDS)
+        assertEquals("the safety ceiling restores the music", listOf(0.2f, 1f), volumes(media))
+    }
+
+    /**
+     * iOS sends the duck level in DECIBELS (-13.98 measured on 2026-10-23), not as a 0..1 gain:
+     * applying the raw number as a gain is meaningless. A dB request is converted to linear gain
+     * before the floor clamp, so -13.98 dB ducks to about 0.20.
+     */
+    @Test fun aDecibelRequestIsConvertedInsteadOfAppliedAsRawGain() {
+        val coordinator = coordinator()
+        val media = track()
+        coordinator.acquire(media, AudioChannel.MEDIA, attributes)
+        coordinator.duckMedia(500, -13.9794f)
+        val applied = volumes(media).single()
+        assertEquals("−13.98 dB is about 20% linear gain", 0.2f, applied, 0.02f)
     }
 
     private fun coordinator(enabled: Boolean = true, autoYield: Boolean = true) =
