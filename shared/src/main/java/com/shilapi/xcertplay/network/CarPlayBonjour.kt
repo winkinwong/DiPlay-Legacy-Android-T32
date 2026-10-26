@@ -74,6 +74,25 @@ internal fun <T> bindMdnsWithRetry(
     return bindings
 }
 
+/** One family's bind failure, as the report needs to see it: family, exception type, bounded cause. */
+internal fun mdnsFailureNote(address: InetAddress, failure: IOException): String {
+    val family = if (address is Inet4Address) "IPv4" else "IPv6"
+    val message = failure.message?.take(120) ?: failure.javaClass.simpleName
+    return "$family ${failure.javaClass.simpleName}: $message"
+}
+
+/**
+ * The detail appended to the all-families-failed IOException: whether the multicast lock is held
+ * and what the socket layer actually said. The 2026-10-26 field failure logged the same generic
+ * message 31 times without a reason, so "port held" and "this ROM's multicast bind is broken"
+ * could only be argued, not answered.
+ */
+internal fun mdnsFailureDetail(failures: List<String>, multicastLockHeld: Boolean): String {
+    val lock = if (multicastLockHeld) "held" else "absent"
+    val notes = failures.takeLast(4).distinct().joinToString("; ")
+    return if (notes.isEmpty()) "(multicastLock=$lock)" else "(multicastLock=$lock; $notes)"
+}
+
 data class CarPlayBonjourEndpoint(
     val serviceName: String,
     val host: String,
@@ -201,6 +220,10 @@ class CarPlayBonjour(
     private val localAdvertisedAddress = advertisedHostAddress()
     private val advertisedAddresses = (listOfNotNull(localAdvertisedAddress) + additionalAddresses).distinct()
     @Volatile private var publishedFamilies = "none"
+    /** Which discovery path [runWorker] drains: live JmDNS sockets, or NSD queue. */
+    @Volatile private var workerUsesInterface = false
+    /** Why the bundled mDNS bind failed, carried into the NSD-failure message and the report. */
+    @Volatile private var mdnsFailureReason = ""
     private val addedCount = AtomicInteger()
     private val resolvedCount = AtomicInteger()
     private val addressMismatchCount = AtomicInteger()
@@ -213,7 +236,8 @@ class CarPlayBonjour(
         "bonjourAdded=${addedCount.get()} bonjourResolved=${resolvedCount.get()} " +
             "bonjourAddressMismatch=${addressMismatchCount.get()} connectProbes=${probeCount.get()} " +
             "connectProbe2xx=${successfulProbeCount.get()} lastProbe=${lastProbe.get()} " +
-            "mdnsFamilies=$publishedFamilies"
+            "mdnsFamilies=$publishedFamilies" +
+            (if (mdnsFailureReason.isEmpty()) "" else " mdnsBindFailure=$mdnsFailureReason")
     private val multicastLock = ((context.applicationContext ?: context).let { ctx ->
         (ctx.getSystemService(Context.WIFI_SERVICE) as? WifiManager)
             ?: runCatching {
@@ -328,62 +352,19 @@ class CarPlayBonjour(
             started = true
             try {
                 multicastLock?.acquire()
-                if (useInterfaceMdns) {
-                    requireNotNull(localAdvertisedAddress) {
-                        "Interface mDNS requires a local advertised address"
-                    }
-                    // Some Android 4.x MulticastSocket implementations bind port 5353
-                    // before enabling SO_REUSEADDR, so the second address family can
-                    // fail with EADDRINUSE even if no other process owns the port.
-                    // A fast reconnect can also still hold the port from the previous
-                    // instance's close, so an all-failed bind is retried briefly.
-                    val boundFamilies = mutableListOf<String>()
-                    val bindings = bindMdnsWithRetry(
-                        maxAttempts = MDNS_BIND_MAX_ATTEMPTS,
-                        retryDelayMillis = MDNS_BIND_RETRY_DELAY_MILLIS,
-                        sleep = { millis -> runCatching { Thread.sleep(millis) } },
-                    ) {
-                        bindAvailableMdnsFamilies(
-                            advertisedAddresses,
-                            bind = { address -> JmDNS.create(address, "carplay-${config.deviceId.replace(":", "")}") },
-                            onFailure = { address, failure ->
-                                Log.w(TAG, "mDNS bind failed for " +
-                                    (if (address is Inet4Address) "IPv4" else "IPv6") +
-                                    "; preserving other advertised families", failure)
-                            },
-                        )
-                    }
-                    // Take ownership of every successfully created socket before registering
-                    // the first service: if registration throws, cleanup must close all sockets.
-                    interfaceMdns.addAll(bindings.map { it.second })
-                    for ((address, dns) in bindings) {
-                        dns.addServiceListener("$CARPLAY_CONTROL_SERVICE_TYPE.local.", interfaceListener)
-                        dns.registerService(ServiceInfo.create(
-                            "$AIRPLAY_SERVICE_TYPE.local.", config.deviceName, config.port,
-                            0, 0, CarPlayBonjourProtocol.airPlayTxtRecords(config, identity),
-                        ))
-                        boundFamilies += if (address is Inet4Address) "IPv4" else "IPv6"
-                    }
-                    if (boundFamilies.isEmpty()) {
-                        throw IOException("Interface mDNS could not bind on any advertised address")
-                    }
-                    publishedFamilies = boundFamilies.joinToString(",")
+                if (useInterfaceMdns && startInterfaceMdns()) {
+                    workerUsesInterface = true
                 } else {
-                    registerAirPlay()
-                    registrationRequested = true
-                    if (!registrationLatch.await(NSD_REGISTRATION_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS)) {
-                        throw IOException("AirPlay NSD registration timed out")
+                    // Android 4.x makes 5353 effectively exclusive: the firmware's own mdnsd, or a
+                    // socket the previous instance's slow close has not released, can keep JmDNS
+                    // from ever binding — the 2026-10-26 field failure showed the same generic
+                    // message 31 times. NSD publishes through the system responder instead of
+                    // binding 5353 itself, so an unusable bundled mDNS must not kill the bring-up.
+                    if (useInterfaceMdns) {
+                        Log.i(TAG, "mDNS bind failed; falling back to NSD: $mdnsFailureReason")
                     }
-                    val registration = registrationResult.get()
-                    if (registration != REGISTRATION_OK) {
-                        throw IOException("AirPlay NSD registration failed code=$registration")
-                    }
-                    nsdManager.discoverServices(
-                        CARPLAY_CONTROL_SERVICE_TYPE,
-                        NsdManager.PROTOCOL_DNS_SD,
-                        discoveryListener,
-                    )
-                    discoveryRequested = true
+                    startNsdRegistration()
+                    workerUsesInterface = false
                 }
                 worker = Thread(::runWorker, WORKER_NAME).apply {
                     isDaemon = true
@@ -409,6 +390,74 @@ class CarPlayBonjour(
             }
         }
     }
+
+    /** Binds and publishes over the bundled JmDNS; false when no family could bind at all. */
+    private fun startInterfaceMdns(): Boolean {
+        requireNotNull(localAdvertisedAddress) {
+            "Interface mDNS requires a local advertised address"
+        }
+        // Some Android 4.x MulticastSocket implementations bind port 5353 before enabling
+        // SO_REUSEADDR, so the second address family can fail with EADDRINUSE even if no other
+        // process owns the port. A fast reconnect can also still hold the port from the previous
+        // instance's close, so an all-failed bind is retried briefly before giving up.
+        val failures = mutableListOf<String>()
+        val boundFamilies = mutableListOf<String>()
+        val bindings = bindMdnsWithRetry(
+            maxAttempts = MDNS_BIND_MAX_ATTEMPTS,
+            retryDelayMillis = MDNS_BIND_RETRY_DELAY_MILLIS,
+            sleep = { millis -> runCatching { Thread.sleep(millis) } },
+        ) {
+            bindAvailableMdnsFamilies(
+                advertisedAddresses,
+                bind = { address -> JmDNS.create(address, "carplay-${config.deviceId.replace(":", "")}") },
+                onFailure = { address, failure ->
+                    failures += mdnsFailureNote(address, failure)
+                    Log.w(TAG, "mDNS bind failed for " +
+                        (if (address is Inet4Address) "IPv4" else "IPv6") +
+                        "; preserving other advertised families", failure)
+                },
+            )
+        }
+        // Take ownership of every successfully created socket before registering the first
+        // service: if registration throws, cleanup must close all sockets.
+        interfaceMdns.addAll(bindings.map { it.second })
+        if (bindings.isEmpty()) {
+            mdnsFailureReason = mdnsFailureDetail(failures, multicastLock?.isHeld == true)
+            return false
+        }
+        for ((address, dns) in bindings) {
+            dns.addServiceListener("$CARPLAY_CONTROL_SERVICE_TYPE.local.", interfaceListener)
+            dns.registerService(ServiceInfo.create(
+                "$AIRPLAY_SERVICE_TYPE.local.", config.deviceName, config.port,
+                0, 0, CarPlayBonjourProtocol.airPlayTxtRecords(config, identity),
+            ))
+            boundFamilies += if (address is Inet4Address) "IPv4" else "IPv6"
+        }
+        publishedFamilies = boundFamilies.joinToString(",")
+        return true
+    }
+
+    private fun startNsdRegistration() {
+        registerAirPlay()
+        registrationRequested = true
+        if (!registrationLatch.await(NSD_REGISTRATION_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS)) {
+            throw IOException("AirPlay NSD registration timed out${bindFailureSuffix()}")
+        }
+        val registration = registrationResult.get()
+        if (registration != REGISTRATION_OK) {
+            throw IOException("AirPlay NSD registration failed code=$registration${bindFailureSuffix()}")
+        }
+        nsdManager.discoverServices(
+            CARPLAY_CONTROL_SERVICE_TYPE,
+            NsdManager.PROTOCOL_DNS_SD,
+            discoveryListener,
+        )
+        discoveryRequested = true
+        publishedFamilies = "nsd"
+    }
+
+    private fun bindFailureSuffix(): String =
+        if (mdnsFailureReason.isEmpty()) "" else " after mDNS bind failure $mdnsFailureReason"
 
     override fun close() {
         val workerToJoin: Thread?
@@ -479,7 +528,7 @@ class CarPlayBonjour(
 
     private fun runWorker() {
         while (!closed) {
-            if (useInterfaceMdns) {
+            if (workerUsesInterface) {
                 try {
                     while (true) emit(discoveryEvents.poll() ?: break)
                     val (endpoint, address) = interfaceServices.poll(

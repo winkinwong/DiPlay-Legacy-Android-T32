@@ -90,4 +90,28 @@ class CarPlayBonjourFallbackTest {
         assertEquals(1, calls)
         assertTrue(delays.isEmpty())
     }
+
+    /** The report must carry what the socket layer actually said, per family. */
+    @Test fun aBindFailureNoteCarriesFamilyTypeAndReason() {
+        val note = mdnsFailureNote(
+            InetAddress.getByName("192.168.43.1"),
+            java.net.BindException("EADDRINUSE (Bind failed)"),
+        )
+        assertEquals("IPv4 BindException: EADDRINUSE (Bind failed)", note)
+    }
+
+    @Test fun theDetailCountsLockAndDistinctReasons() {
+        val detail = mdnsFailureDetail(
+            listOf("IPv4 BindException: EADDRINUSE", "IPv4 BindException: EADDRINUSE", "IPv6 IOException: bad"),
+            multicastLockHeld = true,
+        )
+        assertTrue(detail.contains("multicastLock=held"))
+        assertEquals("duplicates collapse to one", 1, Regex("BindException").findAll(detail).count())
+        assertTrue(detail.contains("bad"))
+    }
+
+    @Test fun noLockAndNoNotesStillReports() {
+        val detail = mdnsFailureDetail(emptyList(), multicastLockHeld = false)
+        assertEquals("(multicastLock=absent)", detail)
+    }
 }
