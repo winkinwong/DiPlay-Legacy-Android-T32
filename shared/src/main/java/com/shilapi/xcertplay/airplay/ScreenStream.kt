@@ -65,6 +65,24 @@ class ScreenStream(
     private var lastPayloadNanos = 0L
     /** Receive-thread owned: the last reported stall duration. */
     private var lastStallReportMillis = 0L
+    /**
+     * Keyframe-nudge backoff state, owned by the receive thread. The iPhone never asks how fast the
+     * receiver decodes; it watches TCP, and every keyframe request earns a 30-60 KB burst whose spike
+     * the iPhone's congestion controller reads as trouble — measured 2026-10-26, one evening produced
+     * 139 requests over 81 stall reports while the receive loop sat at processMaxUs p50=1 ms. A
+     * sender-pause must not be answered with a distress beacon: the engine may nudge once per
+     * doubling interval instead of once per report. Both reset the moment a payload arrives again.
+     */
+    private var nextNudgeAtMillis = 0L
+    private var nudgeDelayMillis = NUDGE_FIRST_INTERVAL_MILLIS
+
+    /** True when the engine may send one keyframe request for this stall episode right now. */
+    internal fun takeNudgeSlot(stalledMillis: Long): Boolean {
+        if (stalledMillis < nextNudgeAtMillis) return false
+        nextNudgeAtMillis = stalledMillis + nudgeDelayMillis
+        nudgeDelayMillis = (nudgeDelayMillis * 2).coerceAtMost(NUDGE_MAX_INTERVAL_MILLIS)
+        return true
+    }
 
     /**
      * Port of upstream #249/#288: on slow-decrypt hardware (the X-Trail's i.MX6 decrypts at
@@ -139,6 +157,13 @@ class ScreenStream(
     private fun accept(bound: ServerSocket) {
         try {
             val accepted = bound.accept()
+            // The iPhone never asks how fast the receiver decodes; its rate controller watches TCP ACKs
+            // and the receive window and pauses when the window stops opening. A large kernel buffer
+            // absorbs bursts before the app drains them, so ACKs keep flowing and the sender never
+            // sees the stall — measured 2026-10-26: wireless froze at a 61-packet/10s baseline while
+            // processMaxUs p50 was 1 ms, i.e. the receive loop was idle and iOS simply stopped sending.
+            runCatching { accepted.receiveBufferSize = RECEIVE_BUFFER_BYTES }
+            runCatching { onDiagnostic("video socket recvBuf=${accepted.receiveBufferSize}") }
             socket = accepted
             run(accepted)
         } catch (error: Exception) {
@@ -164,6 +189,9 @@ class ScreenStream(
                 val body = readFully(input, bodySize) ?: break
                 val arrivalNanos = System.nanoTime()
                 lastPayloadNanos = arrivalNanos
+                // The sender is talking again: the next stall episode nudges from the front.
+                nextNudgeAtMillis = 0L
+                nudgeDelayMillis = NUDGE_FIRST_INTERVAL_MILLIS
                 stats.received(HEADER_LEN + bodySize)
                 AirPlayMediaActivity.onPayload()
                 onMessage(header, body, stats, arrivalNanos)
@@ -316,10 +344,20 @@ class ScreenStream(
          * one frame, a systematic nonce/key desync still ends the stream (upstream #180).
          */
         const val MAX_CONSECUTIVE_DECRYPT_FAILURES = 30
-        /** Bounded decrypt backlog (upstream #249): at 30 fps this is ~0.3 s of video. */
-        const val DECRYPT_QUEUE_CAPACITY = 10
+        /**
+         * Bounded decrypt backlog: ~1 s of video at 30 fps (upstream #249 used 10 frames). The X-Trail
+         * decrypts at 6-30 MB/s, so on this head unit the queue is insurance for GC/VPU spikes rather
+         * than a steady-state bottleneck; keeping it wide lets the receive loop keep reading, which
+         * keeps the kernel ACKing and gives the iPhone's rate controller no signal that the car is slow.
+         */
+        const val DECRYPT_QUEUE_CAPACITY = 30
         /** How long the receive loop waits for a decrypt slot before dropping a frame (#288). */
         const val DECRYPT_QUEUE_OFFER_WAIT_MILLIS = 120L
+        /** Kernel receive buffer target for the video socket: 3-8 s of video at wireless rates. */
+        const val RECEIVE_BUFFER_BYTES = 512 * 1024
+        /** First and largest gap between keyframe requests during one stall episode. */
+        const val NUDGE_FIRST_INTERVAL_MILLIS = 4_000L
+        const val NUDGE_MAX_INTERVAL_MILLIS = 32_000L
     }
 }
 

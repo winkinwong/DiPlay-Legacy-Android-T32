@@ -145,16 +145,26 @@ class CarPlayMediaEngine(
      * link health snapshot: if the wlan counters kept moving and the radio level stayed put, the
      * receive path was alive and the sender is what stopped; if the radio went quiet, look at the
      * air, not the decoder.
+     *
+     * The nudge itself follows [ScreenStream.takeNudgeSlot]'s exponential backoff — the report
+     * keeps arriving every second, but keyframe requests (each one a 30-60 KB burst the iPhone
+     * reads as congestion) come at 4/8/16/32 s. The decoder-path handler (setVideoRecoveryHandler)
+     * keeps nudging at its own 1 s rate: that path has frames arriving and the decoder is truly
+     * stuck, a different problem from an idle silent sender.
      */
     internal fun handleReceiveStall(session: AirPlaySession, type: Int, screen: ScreenStream, millis: Long) {
         if (streams[StreamKey(session, type)] !== screen) return
-        val command = if (type == STREAM_TYPE_ALT_SCREEN) {
-            mapOf("type" to "forceKeyFrame", "params" to mapOf("uuid" to AirPlayInfoPlist.ALT_UUID))
+        if (screen.takeNudgeSlot(millis)) {
+            val command = if (type == STREAM_TYPE_ALT_SCREEN) {
+                mapOf("type" to "forceKeyFrame", "params" to mapOf("uuid" to AirPlayInfoPlist.ALT_UUID))
+            } else {
+                mapOf("type" to "forceKeyFrame")
+            }
+            val sent = session.sendCommand(command)
+            session.logDebug("Video recovery: receive stalled ${millis}ms; requested keyframe sent=$sent")
         } else {
-            mapOf("type" to "forceKeyFrame")
+            session.logDebug("Video recovery: receive stalled ${millis}ms; keyframe request backoff")
         }
-        val sent = session.sendCommand(command)
-        session.logDebug("Video recovery: receive stalled ${millis}ms; requested keyframe sent=$sent")
         runCatching { linkHealthProvider()?.stallSnapshot() }
             .getOrNull()
             ?.let { session.logDebug("Video recovery: stall link state $it") }

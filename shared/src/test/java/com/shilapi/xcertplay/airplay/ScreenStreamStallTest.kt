@@ -3,6 +3,7 @@ package com.shilapi.xcertplay.airplay
 import java.net.Socket
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -110,6 +111,32 @@ class ScreenStreamStallTest {
             listener.stallReports.size <= 5,
         )
         stream.close()
+    }
+
+    /**
+     * A silent sender must not be answered with a keyframe request every second: each request earns
+     * a 30-60 KB burst the iPhone reads as congestion, which is how one pause becomes a rate cut
+     * and a longer next one. The first nudge is immediate, then 4 s, 8 s, doubling to a 32 s cap.
+     */
+    @Test fun keyframeNudgesBackOffExponentiallyDuringOneEpisode() {
+        val screen = ScreenStream(ByteArray(32))
+        assertTrue("first stall nudges at once", screen.takeNudgeSlot(2_000))
+        assertFalse("inside the 4 s window it stays quiet", screen.takeNudgeSlot(4_000))
+        assertTrue("4 s later one nudge again", screen.takeNudgeSlot(6_000))
+        assertFalse("the interval doubled to 8 s", screen.takeNudgeSlot(12_000))
+        assertTrue("6_000+8_000 reaches the next slot", screen.takeNudgeSlot(14_000))
+        screen.close()
+    }
+
+    @Test fun nudgeBackoffStopsGrowingAtTheCap() {
+        val screen = ScreenStream(ByteArray(32))
+        var granted = 0
+        for (millis in 0L..300_000L step 1_000) {
+            if (screen.takeNudgeSlot(millis)) granted++
+        }
+        // 4+8+16+32·n: five minutes of stall allows about ten nudges — never 300.
+        assertTrue("expected ~10 capped nudges, got $granted", granted in 8..14)
+        screen.close()
     }
 
     private fun stalledTestStream(): ScreenStream =
