@@ -882,9 +882,14 @@ object AirPlayPersistence {
             .apply()
     }
 
+    /**
+     * On this head unit the vendor iPod service claims every USB iPhone, and the guard is a
+     * no-op where root is unavailable, so an unconfigured install defaults it on: the driver
+     * who wants the factory iPod UI can still turn it off in Settings.
+     */
     fun loadStopIpodOnUsb(context: Context): Boolean =
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            .getBoolean(KEY_STOP_IPOD_ON_USB, false)
+            .getBoolean(KEY_STOP_IPOD_ON_USB, true)
 
     fun saveStopIpodOnUsb(context: Context, stopIpodOnUsb: Boolean) {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()

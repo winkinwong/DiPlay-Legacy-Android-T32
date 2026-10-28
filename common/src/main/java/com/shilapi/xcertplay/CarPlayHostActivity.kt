@@ -400,6 +400,7 @@ class CarPlayHostActivity : ComponentActivity() {
     private var microphoneAvailable = false
     private var microphonePermissionResolved = false
     private var wirelessEnabled = false
+    private var cableAdoptionChecked = false
     private var mfiTarget = MfiTarget.LOCAL
     private var mfiI2cPath = AirPlayPersistence.DEFAULT_MFI_I2C_PATH
     private var remoteMfiServer = ""
@@ -836,19 +837,56 @@ class CarPlayHostActivity : ComponentActivity() {
         setIntent(intent)
         if (isIphoneUsbAttachment(intent)) {
             if (wirelessEnabled) {
-                if (menuOpen) cancelSettingsEdits()
-                AirPlayPersistence.saveWirelessEnabled(this, false)
-                wirelessEnabled = false
-                wirelessPermissionsReady = true
-                if (controller != null) {
-                    restartCarPlay("switching to USB")
-                }
-                requestStartupPrerequisites()
+                switchToUsbMode()
             } else if (controller == null) {
                 requestStartupPrerequisites()
             }
         }
     }
+
+    /**
+     * The iPhone is on the cable: leave wireless mode and bring wired CarPlay up, exactly as the
+     * USB attach broadcast would have. Shared by the broadcast path and the cable check in
+     * [onResume], which exists because the head unit's own iPod app can swallow that broadcast.
+     */
+    private fun switchToUsbMode() {
+        if (menuOpen) cancelSettingsEdits()
+        AirPlayPersistence.saveWirelessEnabled(this, false)
+        wirelessEnabled = false
+        wirelessPermissionsReady = true
+        if (controller != null) {
+            restartCarPlay("switching to USB")
+        }
+        requestStartupPrerequisites()
+    }
+
+    /**
+     * The iPod app claims the iPhone at attach on this head unit, so the system may deliver the
+     * USB broadcast to it and never to this screen. On the first resume after the screen opens,
+     * ask the USB stack directly: if the iPhone is already on the cable, start wired. Checked
+     * once per screen, never again, so charging the phone during a live wireless session is left
+     * alone on every later resume.
+     */
+    private fun adoptAttachedIphoneOnce() {
+        if (cableAdoptionChecked || wirelessEnabled.not()) return
+        cableAdoptionChecked = true
+        if (hasAttachedIphone(attachedUsbVendorIds())) {
+            switchToUsbMode()
+        }
+    }
+
+    private fun hasAttachedIphone(vendorIds: Set<Int>): Boolean =
+        IphoneUsbMatcher.APPLE_VENDOR_ID in vendorIds
+
+    /** Test seam: production reads the live UsbManager enumeration. */
+    internal var attachedUsbVendorIdsProvider: (() -> Set<Int>)? = null
+
+    private fun attachedUsbVendorIds(): Set<Int> =
+        attachedUsbVendorIdsProvider?.invoke() ?: runCatching {
+            (getSystemService(Context.USB_SERVICE) as? UsbManager)
+                ?.deviceList?.values?.mapTo(mutableSetOf()) { it.vendorId }
+                ?: emptySet()
+        }.getOrDefault(emptySet())
 
     private fun isIphoneUsbAttachment(intent: Intent): Boolean {
         if (intent.action != UsbManager.ACTION_USB_DEVICE_ATTACHED) return false
@@ -907,6 +945,7 @@ class CarPlayHostActivity : ComponentActivity() {
         // The settings screen returns here with FLAG_ACTIVITY_REORDER_TO_FRONT, so this screen is
         // resumed, not recreated: refresh what that screen can change before it is used again.
         if (!menuOpen) loadConnectionSettings()
+        if (!menuOpen) adoptAttachedIphoneOnce()
         locationPermissionAvailable = hasFineLocationPermission()
         if (locationReportingEnabled && !locationPermissionAvailable && !menuOpen) {
             requestLocationPermission()

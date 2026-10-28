@@ -371,8 +371,7 @@ class CarPlayHostSettingsTest {
         assertFalse(activity.isFinishing)
     }
 
-    @Test fun usbAttachmentClosesSettingsAndRestartsInPlace() {
-        org.robolectric.shadows.ShadowVpnService.setPrepareResult(null)
+    @Test fun usbAttachmentClosesSettingsAndRestartsInPlace() {        org.robolectric.shadows.ShadowVpnService.setPrepareResult(null)
         attachController()
         AirPlayPersistence.saveWirelessEnabled(activity, true)
         invoke("loadPersistedSettings")
@@ -400,6 +399,56 @@ class CarPlayHostSettingsTest {
         assertEquals(true, method.invoke(activity, attached))
         assertEquals(false, method.invoke(activity, Intent(UsbManager.ACTION_USB_DEVICE_ATTACHED)))
         assertEquals(false, method.invoke(activity, Intent(UsbManager.ACTION_USB_DEVICE_DETACHED).putExtra(UsbManager.EXTRA_DEVICE, device)))
+    }
+
+    /**
+     * The head unit's iPod app claims the iPhone at attach and can swallow the USB broadcast, so
+     * opening DiPlay with the cable already in must reach the same wired decision without it.
+     */
+    @Test fun attachedIphoneAtStartupAdoptsWiredWithoutTheBroadcast() {
+        org.robolectric.shadows.ShadowVpnService.setPrepareResult(null)
+        attachController()
+        AirPlayPersistence.saveWirelessEnabled(activity, true)
+        invoke("loadConnectionSettings")
+        setField("attachedUsbVendorIdsProvider", { setOf(0x05ac) })
+        invoke("adoptAttachedIphoneOnce")
+        assertFalse(AirPlayPersistence.loadWirelessEnabled(activity))
+        assertFalse(field("wirelessEnabled") as Boolean)
+        assertEquals(true, field("cableAdoptionChecked"))
+        assertFalse(activity.isFinishing)
+    }
+
+    @Test fun otherUsbDevicesDoNotAdoptWiredMode() {
+        AirPlayPersistence.saveWirelessEnabled(activity, true)
+        invoke("loadConnectionSettings")
+        setField("attachedUsbVendorIdsProvider", { setOf(0x1a86, 0x1234) })
+        invoke("adoptAttachedIphoneOnce")
+        assertTrue(AirPlayPersistence.loadWirelessEnabled(activity))
+        assertTrue(field("wirelessEnabled") as Boolean)
+        assertEquals(true, field("cableAdoptionChecked"))
+    }
+
+    /** Checked once per screen: charging the phone during a live wireless session must stay wireless
+     *  on every later resume, so the adoption never runs a second time. */
+    @Test fun cableAdoptionRunsOncePerScreen() {
+        org.robolectric.shadows.ShadowVpnService.setPrepareResult(null)
+        attachController()
+        AirPlayPersistence.saveWirelessEnabled(activity, true)
+        invoke("loadConnectionSettings")
+        setField("attachedUsbVendorIdsProvider", { setOf(0x05ac) })
+        invoke("adoptAttachedIphoneOnce")
+        val generation = field("restartGeneration")
+        assertTrue(generation == 1)
+
+        AirPlayPersistence.saveWirelessEnabled(activity, true)
+        invoke("loadConnectionSettings")
+        invoke("adoptAttachedIphoneOnce")
+        assertTrue(AirPlayPersistence.loadWirelessEnabled(activity))
+        assertEquals(generation, field("restartGeneration"))
+    }
+
+    @Test fun ipodGuardDefaultsOnForThisHeadUnit() {
+        assertTrue(AirPlayPersistence.loadStopIpodOnUsb(activity))
     }
 
     @Test fun cancelRestoresSafeAreaResetAfterTheWindowChangesSize() {
