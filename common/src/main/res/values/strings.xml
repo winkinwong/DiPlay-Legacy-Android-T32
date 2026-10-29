@@ -325,6 +325,7 @@
     <string name="s_2_4_ghz" tools:ignore="MissingTranslation">2.4 GHz</string>
     <string name="s_2_pair_your_iphone">2 · Pair your iPhone</string>
     <string name="s_300_ms_default">300 ms · default</string>
+    <string name="s_10_fps_minimum_load">10 fps · minimum load</string>
     <string name="s_15_fps_lightest_load">15 fps · lightest load</string>
     <string name="s_30_fps_lighter_load">30 fps · lighter load</string>
     <string name="s_45_fps_balanced">45 fps · balanced</string>

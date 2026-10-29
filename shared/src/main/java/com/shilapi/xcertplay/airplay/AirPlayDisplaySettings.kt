@@ -12,7 +12,13 @@ data class AirPlayPhysicalSizeMm(
 
 /** User-adjustable display values with the same stepped ranges used by the settings UI. */
 object AirPlayDisplaySettings {
-    const val MIN_FPS = 15
+    /**
+     * Offered frame rates. 10 fps exists for head units whose hardware decoder cannot meet the
+     * 15 fps budget: the NTDA3 i.MX6 needs ~80 ms per 768x432 frame (measured 2026-10-29), so its
+     * real ceiling is ~12 fps and every 15 fps window reported "decoder too slow".
+     */
+    val FPS_OPTIONS = listOf(10, 15, 30, 45, 60)
+    const val MIN_FPS = 10
     const val MAX_FPS = 60
     const val FPS_STEP = 15
     const val DEFAULT_FPS = MAX_FPS
@@ -25,8 +31,9 @@ object AirPlayDisplaySettings {
     const val MIN_REPORTED_PHYSICAL_MM = 1
     const val MAX_REPORTED_PHYSICAL_MM = 2_000
 
+    /** Nearest offered rate, so an out-of-list value from an old build or a slider still works. */
     fun sanitizeFps(value: Int): Int =
-        snapToStep(value, MIN_FPS, MAX_FPS, FPS_STEP)
+        FPS_OPTIONS.minByOrNull { kotlin.math.abs(it - value) } ?: DEFAULT_FPS
 
     fun sanitizeWidthPhysicalMm(value: Int): Int =
         snapToStep(
@@ -79,7 +86,7 @@ object AirPlayDisplaySettings {
     }
 
     fun fpsProgress(value: Int): Int =
-        (sanitizeFps(value) - MIN_FPS) / FPS_STEP
+        FPS_OPTIONS.indexOf(sanitizeFps(value)).coerceAtLeast(0)
 
     fun widthPhysicalMmProgress(value: Int): Int =
         (sanitizeWidthPhysicalMm(value) - MIN_WIDTH_PHYSICAL_MM) / WIDTH_PHYSICAL_MM_STEP

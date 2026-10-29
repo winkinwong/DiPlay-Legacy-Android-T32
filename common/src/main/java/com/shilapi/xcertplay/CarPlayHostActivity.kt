@@ -1959,10 +1959,7 @@ class CarPlayHostActivity : ComponentActivity() {
         content.addView(
             buildStepSliderSection(
                 title = getString(R.string.frame_rate),
-                values = (
-                    AirPlayDisplaySettings.MIN_FPS..AirPlayDisplaySettings.MAX_FPS
-                    step AirPlayDisplaySettings.FPS_STEP
-                    ).toList(),
+                values = AirPlayDisplaySettings.FPS_OPTIONS,
                 selectedValue = fps,
                 label = { "$it fps" },
                 onValueChanged = { value ->

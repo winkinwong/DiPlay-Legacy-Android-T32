@@ -872,7 +872,14 @@ private class VideoDecoder(
     private var duplicateConfigLogged = false
     private var failureReports = 0
     private val referenceChain = VideoReferenceChain()
-    private var lastKeyFrameRequestNs = 0L
+    /**
+     * Upstream #216's repeat-request path used to fire once per second regardless of whether the
+     * sender was even transmitting. The pacer keeps that cadence while frames arrive and backs off
+     * while the stream is silent (see [KeyFrameRequestPacer]).
+     */
+    private val keyFramePacer = KeyFrameRequestPacer()
+    /** When a video access unit last arrived; drives [KeyFrameRequestPacer]'s starvation test. */
+    private var lastVideoFeedNs = 0L
     /** Upstream #216: when the current wait for an acceptable keyframe began. */
     private var keyframeWaitStartedNs = 0L
     // The main screen keeps the historical log format; other screens are labelled.
@@ -956,7 +963,7 @@ private class VideoDecoder(
                         is VideoJob.DetachSurface -> detach(job.request)
                         // Once per new surface, so it skips the rate limit an earlier request may still hold.
                         is VideoJob.RefreshPicture -> if (decoder != null) {
-                            lastKeyFrameRequestNs = System.nanoTime()
+                            keyFramePacer.forceNext()
                             requestKeyFrame()
                         }
                         is VideoJob.Resync -> recover("video queue overflow")
@@ -1180,6 +1187,8 @@ private class VideoDecoder(
     }
 
     private fun feed(nalus: ByteArray, presentNs: Long = 0L) {
+        // A frame reached the decoder: the sender is not paused, even if this unit gets rejected.
+        lastVideoFeedNs = System.nanoTime()
         val annexB = MediaCodecSupport.toAnnexB(nalus)
         val config = lastConfig ?: return
         if (outputSurface == null) return
@@ -1256,13 +1265,12 @@ private class VideoDecoder(
         releaseDecoder()
         referenceChain.reset()
         keyframeWaitStartedNs = 0L
+        keyFramePacer.forceNext()
         requestKeyFrameIfDue()
     }
 
     private fun requestKeyFrameIfDue() {
-        val now = System.nanoTime()
-        if (lastKeyFrameRequestNs != 0L && now - lastKeyFrameRequestNs < 1_000_000_000L) return
-        lastKeyFrameRequestNs = now
+        if (!keyFramePacer.shouldRequest(System.nanoTime(), lastVideoFeedNs)) return
         requestKeyFrame()
     }
 

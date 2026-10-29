@@ -47,6 +47,7 @@ import androidx.core.view.WindowInsetsControllerCompat
 import com.shilapi.xcertplay.adb.LocalAdb
 import com.shilapi.xcertplay.bluetooth.AnwPhoneLinkDiscovery
 import com.shilapi.xcertplay.bluetooth.BluetoothAddressResolver
+import com.shilapi.xcertplay.airplay.AirPlayDisplaySettings
 import com.shilapi.xcertplay.airplay.CarPlayClusterDisplay
 import com.shilapi.xcertplay.airplay.CarPlayDisplayScale
 import com.shilapi.xcertplay.airplay.ClusterTurnCardOverlay
@@ -1413,13 +1414,14 @@ class DiPlayActivity : ComponentActivity() {
                 save = { AirPlayPersistence.saveDisplayScalePercent(this, it) },
             )
             choice(card, getString(R.string.frame_rate), listOf(
+                getString(R.string.s_10_fps_minimum_load),
                 getString(R.string.s_15_fps_lightest_load),
                 getString(R.string.s_30_fps_lighter_load),
                 getString(R.string.s_45_fps_balanced),
                 getString(R.string.s_60_fps_smoother_motion),
-            ), when (AirPlayPersistence.loadFps(this)) {
-                15 -> 0; 45 -> 2; 60 -> 3; else -> 1
-            }) { AirPlayPersistence.saveFps(this, listOf(15, 30, 45, 60)[it]) }
+            ), AirPlayDisplaySettings.fpsProgress(AirPlayPersistence.loadFps(this))) {
+                AirPlayPersistence.saveFps(this, AirPlayDisplaySettings.FPS_OPTIONS[it])
+            }
             // Field report 2026-10-15: a head unit whose hardware decoder
             // cannot keep the frame budget stutters at every offered rate;
             // point the driver at the knob before they blame the connection.

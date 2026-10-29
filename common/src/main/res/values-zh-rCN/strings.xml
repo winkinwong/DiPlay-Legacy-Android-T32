@@ -324,6 +324,7 @@
     <string name="s_2_4_ghz">2.4 GHz</string>
     <string name="s_2_pair_your_iphone">2 · 配对你的 iPhone</string>
     <string name="s_300_ms_default">300 毫秒 · 默认</string>
+    <string name="s_10_fps_minimum_load">10 帧/秒 · 最省负载</string>
     <string name="s_15_fps_lightest_load">15 帧/秒 · 负载最小</string>
     <string name="s_30_fps_lighter_load">30 帧/秒 · 减轻负载</string>
     <string name="s_45_fps_balanced">45 帧/秒 · 均衡</string>
