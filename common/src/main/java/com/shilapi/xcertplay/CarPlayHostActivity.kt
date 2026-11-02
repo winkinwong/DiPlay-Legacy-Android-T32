@@ -3959,6 +3959,7 @@ class CarPlayHostActivity : ComponentActivity() {
             surface = null,
             videoWidth = videoWidth,
             videoHeight = videoHeight,
+            expectedFps = fps,
             preferSoftwareHevcDecoder = hevcSoftwareDecoderEnabled,
             advancedAudioChannelMapping = advancedAudioChannelMapping,
             audioFocusEnabled = AirPlayPersistence.loadAudioFocusEnabled(this),

@@ -290,6 +290,8 @@ class AndroidMediaSink(
     surface: Surface? = null,
     private val videoWidth: Int = 1280,
     private val videoHeight: Int = 720,
+    /** Frame rate the current session asked for; feeds the decoder-too-slow budget in the stats line. */
+    private val expectedFps: Int = 0,
     private val preferSoftwareHevcDecoder: Boolean = false,
     private val advancedAudioChannelMapping: Boolean = false,
     private val audioFocusEnabled: Boolean = false,
@@ -739,6 +741,7 @@ class AndroidMediaSink(
         videoWidth,
         videoHeight,
         preferSoftwareHevcDecoder,
+        expectedFps = expectedFps,
         requestKeyFrame = { requestVideoRecovery(type) },
         report = { videoDiagnosticHandlers[type]?.invoke(it) },
         statsLabel = statsLabel,
@@ -834,6 +837,8 @@ private class VideoDecoder(
     private val width: Int,
     private val height: Int,
     private val preferSoftwareHevcDecoder: Boolean,
+    /** Frame rate this stream asked for; drives the decoder-too-slow hint's budget. */
+    private val expectedFps: Int = 0,
     private val requestKeyFrame: () -> Unit,
     private val report: (String) -> Unit,
     statsLabel: String? = null,
@@ -886,6 +891,7 @@ private class VideoDecoder(
     private val stats = VideoStats(
         statsLabel ?: if (streamType == MAIN_SCREEN_TYPE) "" else " stream=$streamType",
         framePixels = width * height,
+        fps = expectedFps,
     )
     private val thread = Thread(::run, "carplay-video").apply { isDaemon = true }
 
@@ -1261,6 +1267,15 @@ private class VideoDecoder(
         Log.w(TAG, "Video recovery: $reason; waiting for keyframe")
         stats.onRecovery()
         report("recovery: $reason; waiting for keyframe")
+        // A backlog discard is the decoder losing a race, not a network event: say so once per session
+        // with the settings that fit this class of unit (measured 2026-10-30: 30 fps needs 33 ms but
+        // the NTDA3 VPU needs 56-66 ms per frame at 70-90%, so every 30 fps session discards frames).
+        if (reason.startsWith("video backlog exceeded") && stats.onBacklogDiscard() == 1) {
+            report(
+                "Video: decoder overload - frames discarded faster than this unit decodes them; " +
+                    "recommend 15 fps and 60-70% resolution",
+            )
+        }
         // Recreate with codec-specific data: flush can discard CSD before the first output.
         releaseDecoder()
         referenceChain.reset()

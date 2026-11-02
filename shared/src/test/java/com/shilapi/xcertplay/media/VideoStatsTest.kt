@@ -80,4 +80,43 @@ class VideoStatsTest {
         val line = stats.logIfDue()!!
         assertFalse("no quality on a frozen window", line.contains("quality="))
     }
+
+    /**
+     * 47 ms is healthy at 15 fps (66 ms budget) even though it looked "too slow" against the old
+     * fixed 24 fps gauge — judging against the requested rate stops false alarms in field reports.
+     */
+    @Test
+    fun theSlowDecoderHintUsesTheRequestedFrameRateBudget() {
+        var clock = 0L
+        val fifteen = VideoStats(label = "", nanoTime = { clock }, fps = 15)
+        repeat(10) { fifteen.onDecodeLatency(47_000_000) }
+        fifteen.onReceived(1000)
+        clock = 5_000_000_000L
+        val line = fifteen.logIfDue()!!
+        assertTrue(line.contains("decode p50=47ms"))
+        assertFalse("47 ms fits 15 fps", line.contains("hint="))
+    }
+
+    @Test
+    fun theSameDecodeTimeIsFlaggedAtThirtyFps() {
+        var clock = 0L
+        val thirty = VideoStats(label = "", nanoTime = { clock }, fps = 30)
+        repeat(10) { thirty.onDecodeLatency(47_000_000) }
+        thirty.onReceived(1000)
+        clock = 5_000_000_000L
+        assertTrue("47 ms misses the 33 ms budget", thirty.logIfDue()!!.contains("hint=decoder-too-slow"))
+    }
+
+    /** The report must count backlog discards: they mean "this unit cannot decode the stream". */
+    @Test
+    fun backlogDiscardsAreCountedInTheStatsLine() {
+        var clock = 0L
+        val stats = VideoStats(label = "", nanoTime = { clock })
+        repeat(10) { stats.onDecodeLatency(10_000_000) }
+        stats.onReceived(1000)
+        assertTrue("first discard counts", stats.onBacklogDiscard() == 1)
+        assertTrue("second discard counts", stats.onBacklogDiscard() == 2)
+        clock = 5_000_000_000L
+        assertTrue(stats.logIfDue()!!.contains("backlog=2"))
+    }
 }

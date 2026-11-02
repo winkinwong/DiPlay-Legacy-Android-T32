@@ -8,6 +8,12 @@ internal class VideoStats(
     private val nanoTime: () -> Long = System::nanoTime,
     /** Stream frame size; the quality flag judges bits per PIXEL, so the same bitrate at 100% is judged harsher. */
     private val framePixels: Int = DEFAULT_FRAME_PIXELS,
+    /**
+     * The frame rate this stream asked the iPhone for. The "decoder too slow" hint is judged against
+     * that rate's frame budget: 47 ms is fine at 15 fps (66 ms) and hopeless at 30 fps (33 ms), and
+     * judging everything against 24 fps used to flag healthy 15 fps sessions.
+     */
+    private val fps: Int = 0,
 ) {
     private var windowStartNs = nanoTime()
     private var lastArrivalNs = 0L
@@ -23,6 +29,7 @@ internal class VideoStats(
     private var decodeSamples = 0
     private var late = 0
     private var pacingDelayNanos = 0L
+    private var backlogDiscards = 0
 
     @Synchronized fun onReceived(size: Int) {
         val now = nanoTime()
@@ -52,6 +59,9 @@ internal class VideoStats(
     /** A paced frame left the decoder after its display time and was shown at once. */
     @Synchronized fun onLate() { late++ }
 
+    /** A frame queue overflow was discarded because decoding fell behind; returns the running total. */
+    @Synchronized fun onBacklogDiscard(): Int = ++backlogDiscards
+
     /** Smooth video's current display delay ([PacingDelay]). */
     @Synchronized fun onPacingDelay(ns: Long) { pacingDelayNanos = ns }
 
@@ -61,10 +71,13 @@ internal class VideoStats(
         fun percentileMs(p: Int) = sorted[(decodeSamples - 1) * p / 100] / 1000
         val p50 = percentileMs(50)
         val delay = if (pacingDelayNanos > 0) " delay=%dms".format(pacingDelayNanos / 1_000_000) else ""
-        // A decoder slower than the 24 fps budget cannot keep ANY frame rate
-        // smooth; the stats line tells the driver which knob to turn next.
-        val hint = if (p50 > DECODE_BUDGET_MILLIS_24FPS) " hint=decoder-too-slow-lower-fps" else ""
-        return " decode p50=%dms p90=%dms late=%d".format(p50, percentileMs(90), late) + delay + hint
+        // Judge the decoder against the frame budget of the rate we actually asked for. With no
+        // known rate (older callers, tests) keep the 24 fps reference so the hint never disappears.
+        val budgetMs = if (fps > 0) 1000 / fps else DECODE_BUDGET_MILLIS_24FPS
+        val hint = if (p50 > budgetMs) " hint=decoder-too-slow-lower-fps" else ""
+        return " decode p50=%dms p90=%dms late=%d backlog=%d".format(
+            p50, percentileMs(90), late, backlogDiscards,
+        ) + delay + hint
     }
 
     /**
