@@ -19,6 +19,7 @@ import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
@@ -197,6 +198,9 @@ class CarPlayController(
     private val appContext = context.applicationContext
     private val diagnosticAttempt = diagnosticAttempts.incrementAndGet()
     private val diagnosticRun = AtomicInteger()
+    /** Test seam: production creates the real high-performance lock lazily from the Wi-Fi service. */
+    internal var highPerfWifiLockProvider: (() -> WifiManager.WifiLock?)? = null
+    @Volatile private var highPerfWifiLock: WifiManager.WifiLock? = null
     private val usbManager: UsbManager? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
         context.getSystemService(UsbManager::class.java)
     } else {
@@ -1184,8 +1188,39 @@ class CarPlayController(
             onStatus(CarPlayStatus.StartingHotspot, next)
             next
         }
+        acquireHighPerfWifiLock()
         executor.execute { runWireless(generation) }
     }
+
+    /**
+     * Keeps the head unit's Wi-Fi radio out of driver power save while wireless CarPlay runs.
+     * On this unit the head unit is usually the STA on an external hotspot (dashcam AP): between
+     * video bursts the driver can doze, the AP buffers frames until the STA wakes, and the picture
+     * freezes for seconds although nothing was lost (2026-11-02 field log: 0.2 fps collapses with
+     * ifaceRx dropped=0 errors=0). In AP mode the lock is harmless: the radio stays awake anyway.
+     */
+    internal fun acquireHighPerfWifiLock() {
+        val lock = highPerfWifiLockProvider?.invoke() ?: createHighPerfWifiLock()
+        if (lock == null) return
+        highPerfWifiLock = lock
+        if (!lock.isHeld) runCatching { lock.acquire() }
+        if (lock.isHeld) debugLog("Wi-Fi high-performance lock held during wireless CarPlay")
+    }
+
+    internal fun releaseHighPerfWifiLock() {
+        val lock = highPerfWifiLock
+        if (lock?.isHeld == true) {
+            runCatching { lock.release() }
+            debugLog("Wi-Fi high-performance lock released")
+        }
+    }
+
+    private fun createHighPerfWifiLock(): WifiManager.WifiLock? =
+        runCatching {
+            (appContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager)
+                ?.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "carplay-wireless")
+                ?.apply { setReferenceCounted(false) }
+        }.getOrNull()
 
     private fun restartWireless() {
         val generation = synchronized(wirelessResourceLock) {
@@ -2827,6 +2862,7 @@ class CarPlayController(
             wirelessHandoffFellBack.set(false)
 
             if (service != null && owner != null) closeBestEffort("AirPlay service") { service.detachWireless(owner) }
+            releaseHighPerfWifiLock()
         }
 
     private fun isBluetoothDeviceConnected(device: BluetoothDevice): Boolean = try {
