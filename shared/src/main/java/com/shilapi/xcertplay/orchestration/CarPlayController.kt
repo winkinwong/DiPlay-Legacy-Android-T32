@@ -1201,10 +1201,17 @@ class CarPlayController(
      */
     internal fun acquireHighPerfWifiLock() {
         val lock = highPerfWifiLockProvider?.invoke() ?: createHighPerfWifiLock()
-        if (lock == null) return
+        if (lock == null) {
+            debugLog("Wi-Fi high-performance lock unavailable (no Wi-Fi service)")
+            return
+        }
         highPerfWifiLock = lock
-        if (!lock.isHeld) runCatching { lock.acquire() }
-        if (lock.isHeld) debugLog("Wi-Fi high-performance lock held during wireless CarPlay")
+        val before = lock.isHeld
+        if (!before) runCatching { lock.acquire() }
+        val after = lock.isHeld
+        // Logged regardless of outcome: the 2026-11-03 field run showed no lock line at all, so it
+        // was impossible to tell a working lock from a driver that ignores WIFI_MODE_FULL_HIGH_PERF.
+        debugLog("Wi-Fi high-performance lock requested held=$after (was=$before)")
     }
 
     internal fun releaseHighPerfWifiLock() {

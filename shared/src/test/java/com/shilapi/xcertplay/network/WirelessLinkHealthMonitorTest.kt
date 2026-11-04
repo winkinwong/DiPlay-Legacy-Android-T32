@@ -72,4 +72,20 @@ class WirelessLinkHealthMonitorTest {
         val snapshot = monitor.stallSnapshot()
         assertTrue(snapshot.contains("radio=radioLevel=unavailable"))
     }
+
+    /**
+     * The delta line says "reset" when any counter moves backwards, which the 2026-11-03 field run
+     * showed even while signal deltas were always positive. Absolute values let the next report
+     * answer "weak signal / flapping association / oscillating quality" instead of just "reset".
+     */
+    @Test fun theSnapshotCarriesAbsoluteRadioValues() {
+        var counter = 5L
+        val monitor = WirelessLinkHealthMonitor("wlan0", read = { path, _ ->
+            if (path == "/proc/net/wireless") "wlan0: 1 5 -45 -90 0 0 0 0 0 0" else counter.toString()
+        })
+        val snapshot = monitor.stallSnapshot()
+        assertTrue("absolute radio values must ride along: $snapshot",
+            snapshot.contains("radioAbs=status=1 quality=5 signal=-45 noise=-90"))
+        assertFalse("still no interface text", snapshot.contains("wlan0"))
+    }
 }

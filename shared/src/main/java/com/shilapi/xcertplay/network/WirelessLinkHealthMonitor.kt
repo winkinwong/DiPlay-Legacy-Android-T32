@@ -16,7 +16,7 @@ import java.io.IOException
  * WifiInfo (API 19 AP mode exposes none) and no new permission, and it is a count-free number.
  */
 class WirelessLinkHealthMonitor(
-    interfaceName: String?,
+    private val interfaceName: String?,
     private val intervalMillis: Long = INTERVAL_MILLIS,
     private val read: (String, Int) -> String = ::readBoundedDiagnosticFile,
     private val nowNs: () -> Long = System::nanoTime,
@@ -73,8 +73,18 @@ class WirelessLinkHealthMonitor(
             Regex("ifaceRx\\w+Delta=\\d+").findAll(line).joinToString(" ") { it.value }
         }?.takeIf { it.isNotEmpty() } ?: "ifaceRx=unavailable"
         val radio = radioSource.snapshot()
-        return "link health $iface radio=$radio"
+        // Absolute radio values: the "reset" marker only says a counter moved backwards, but it
+        // cannot say whether the link is weak (low dBm), the association is flapping (status flip)
+        // or the quality is oscillating — the driver's absolute numbers answer that on the 2026-11-03
+        // field case (signal deltas always positive yet resets kept firing).
+        val radioAbs = absoluteRadio()
+        return "link health $iface radio=$radio${if (radioAbs.isEmpty()) "" else " radioAbs=$radioAbs"}"
     }
+
+    private fun absoluteRadio(): String = runCatching {
+        val values = parseProcNetWireless(read("/proc/net/wireless", MAX_PROC_BYTES), interfaceName)
+        "status=${values["Status"]} quality=${values["Quality"]} signal=${values["SignalDbm"]} noise=${values["NoiseDbm"]}"
+    }.getOrDefault("")
 
     companion object {
         const val INTERVAL_MILLIS = 10_000L
