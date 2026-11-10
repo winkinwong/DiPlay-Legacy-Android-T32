@@ -7,6 +7,7 @@ import android.content.ServiceConnection
 import android.os.Binder
 import android.os.IBinder
 import android.os.Parcel
+import android.os.SystemClock
 import android.util.Log
 import com.shilapi.xcertplay.iap2.wire.Iap2Frame
 import java.util.concurrent.Executors
@@ -37,6 +38,9 @@ internal object BydHudBridge {
     private var binding = false
     private var started = false
     private var senderStarted = false
+    /** Paces bind retries so a missing gateway is not asked on every tick (issue #4). */
+    private val bindBackoff = HudBindBackoff()
+    private var gatewayAbsentLogged = false
     private var guidanceSentLogged = false
     private var showing = false
     private var lastSendResult: Int? = null
@@ -72,6 +76,15 @@ internal object BydHudBridge {
 
     fun initialize(appContext: Context) = synchronized(lock) {
         if (context == null) context = appContext.applicationContext
+        // A non-BYD head unit has no SOME/IP gateway at all. Binding on every tick there is pure IPC
+        // churn against the system server (measured as issue #4), so stay completely off instead.
+        if (!gatewayInstalled(appContext)) {
+            if (!gatewayAbsentLogged) {
+                gatewayAbsentLogged = true
+                Log.i(TAG, "SOME/IP gateway absent ($SOMEIP_PACKAGE); HUD bridge stays off")
+            }
+            return@synchronized
+        }
         bindLocked()
         if (!senderStarted) {
             senderStarted = true
@@ -80,6 +93,12 @@ internal object BydHudBridge {
             }.scheduleWithFixedDelay(::tick, BydHudProtocol.REPEAT_MILLIS, BydHudProtocol.REPEAT_MILLIS, TimeUnit.MILLISECONDS)
         }
     }
+
+    private fun gatewayInstalled(appContext: Context): Boolean =
+        runCatching { appContext.packageManager.getPackageInfo(SOMEIP_PACKAGE, 0) }.isSuccess
+
+    /** Test seam: true once the 300 ms pump exists (it must never start without a gateway). */
+    internal val pumpStarted: Boolean get() = senderStarted
 
     fun onFrame(frame: Iap2Frame) = synchronized(lock) {
         val change = route.accept(frame.messageId, frame.payload)
@@ -104,7 +123,10 @@ internal object BydHudBridge {
     }
 
     private fun tick() = synchronized(lock) {
-        if (binder == null && !binding) bindLocked()
+        if (binder == null && !binding) {
+            val now = SystemClock.uptimeMillis()
+            if (bindBackoff.due(now) && !bindLocked()) bindBackoff.failed(now)
+        }
         sendCurrentLocked()
     }
 
@@ -159,20 +181,22 @@ internal object BydHudBridge {
         }.onFailure { Log.w(TAG, "HUD icons unavailable", it) }.getOrDefault(emptyMap())
     }
 
-    private fun bindLocked() {
-        val appContext = context ?: return
-        if (binder != null || binding) return
-        try {
+    private fun bindLocked(): Boolean {
+        val appContext = context ?: return false
+        if (binder != null || binding) return true
+        return try {
             // The gateway's onUnbind requires a MIME type; a typeless bind crashes the whole SOME/IP process.
             val intent = Intent(SOMEIP_ACTION).apply {
                 setClassName(SOMEIP_PACKAGE, SOMEIP_CLASS)
                 type = appContext.packageName
             }
             binding = appContext.bindService(intent, connection, Context.BIND_AUTO_CREATE)
-            Log.i(TAG, "bindService=$binding")
+            if (binding) Log.i(TAG, "bindService accepted") else Log.i(TAG, "bindService rejected; backing off")
+            binding
         } catch (error: Throwable) {
             binding = false
             Log.w(TAG, "cannot bind SOME/IP service", error)
+            false
         }
     }
 
@@ -188,6 +212,7 @@ internal object BydHudBridge {
         override fun onServiceConnected(name: ComponentName, service: IBinder) = onGatewayCallback {
             binder = service
             binding = true
+            bindBackoff.succeeded()
             val registered = transactLocked(TX_REGISTER_CALLBACK, returnsValue = false) { it.writeStrongBinder(callback) }
             val startResult = if (registered == 0) transactLocked(TX_START_SERVICE) { it.writeLong(SERVICE_ID) } else -1
             // Firmware explicitly treats 13 as an already-started service.
@@ -250,6 +275,8 @@ internal object BydHudBridge {
         if (appContext != null && binding) {
             runCatching { appContext.unbindService(connection) }
         }
+        // The gateway existed a moment ago (it died or refused a bind): retry at once, not in 10 s.
+        bindBackoff.succeeded()
         binder = null
         binding = false
         started = false
