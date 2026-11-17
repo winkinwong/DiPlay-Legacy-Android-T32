@@ -186,8 +186,56 @@ class AudioDuckTest {
         assertEquals("−13.98 dB is about 20% linear gain", 0.2f, applied, 0.02f)
     }
 
+    /**
+     * 2026-11-17 field report: "音乐和导航的声音切换还是有点生硬". The -14 dB duck used to land in one
+     * setStereoVolume call; with the real fade duration the sink must walk down over several steps.
+     */
+    @Test fun aDuckFadesDownInsteadOfJumpingToTheTarget() {
+        val coordinator = fadingCoordinator()
+        val media = track()
+        coordinator.acquire(media, AudioChannel.MEDIA, attributes)
+
+        coordinator.duckMedia(500, -13.9794f)
+        assertEquals("no instant step in the same frame", emptyList<Float>(), volumes(media))
+
+        shadowOf(Looper.getMainLooper())
+            .idleFor(MediaVolumeFade.DURATION_MILLIS + 100, TimeUnit.MILLISECONDS)
+        val applied = volumes(media)
+        assertTrue("the duck must be a fade, not one step: $applied", applied.size >= 3)
+        assertEquals("it lands exactly on the request", 0.2f, applied.last(), 0.02f)
+        assertTrue("no intermediate step may already be the target", applied.dropLast(1).all { it > 0.21f })
+        assertTrue("the fade starts near full volume", applied.first() > 0.5f)
+        applied.zipWithNext { a, b -> assertTrue("must fall monotonically: $applied", b <= a + 1e-4f) }
+    }
+
+    @Test fun anUnduckFadesBackUpInsteadOfSnapping() {
+        val coordinator = fadingCoordinator()
+        val media = track()
+        coordinator.acquire(media, AudioChannel.MEDIA, attributes)
+        coordinator.duckMedia(500, 0.2f)
+        shadowOf(Looper.getMainLooper())
+            .idleFor(MediaVolumeFade.DURATION_MILLIS + 100, TimeUnit.MILLISECONDS)
+        VolumeTrackingAudioTrack.volumes[media]?.clear()
+
+        coordinator.unduckMedia()
+        shadowOf(Looper.getMainLooper())
+            .idleFor(MediaVolumeFade.DURATION_MILLIS + 100, TimeUnit.MILLISECONDS)
+        val applied = volumes(media)
+        assertTrue("the restore must be a fade too: $applied", applied.size >= 3)
+        assertEquals("it returns to the pre-duck level", 1f, applied.last(), 1e-3f)
+        assertTrue("the restore starts from the ducked level", applied.first() < 0.4f)
+        applied.zipWithNext { a, b -> assertTrue("must rise monotonically: $applied", b >= a - 1e-4f) }
+    }
+
+    private fun fadingCoordinator() =
+        AudioFocusCoordinator(context, enabled = true, muteMediaOnTransientLoss = true)
+            .also(coordinators::add)
+
     private fun coordinator(enabled: Boolean = true, autoYield: Boolean = true) =
-        AudioFocusCoordinator(context, enabled, autoYield).also(coordinators::add)
+        AudioFocusCoordinator(context, enabled, autoYield)
+            // These cases assert the target levels; the fade itself is covered by the tests below.
+            .also { it.volumeFadeMillis = 0L }
+            .also(coordinators::add)
     private fun track(): AudioTrack = AudioTrack.Builder().setAudioAttributes(attributes)
         .setAudioFormat(AudioFormat.Builder().setSampleRate(44100).setEncoding(AudioFormat.ENCODING_PCM_16BIT)
             .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO).build())

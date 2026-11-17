@@ -12,6 +12,7 @@ import android.media.MediaFormat
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import android.view.Surface
 import androidx.annotation.RequiresApi
@@ -180,7 +181,13 @@ internal class AudioFocusCoordinator(
         runCatching { report(line) }
     }
 
+    /** Instant gain change (focus loss/gain, track bring-up). Cancels any duck fade in flight. */
     private fun setMediaVolume(volume: Float) {
+        if (volumeFade != null) cancelVolumeFade()
+        applyMediaGain(volume)
+    }
+
+    private fun applyMediaGain(volume: Float) {
         mediaVolume = volume
         active.forEach { (track, entry) -> applyMediaVolume(track, entry) }
     }
@@ -195,8 +202,53 @@ internal class AudioFocusCoordinator(
 
     private var duckRestore: Runnable? = null
     private var volumeBeforeDuck: Float? = null
+    /** Test seam: 0 applies duck/unduck at once, as the pre-fade sink did. */
+    internal var volumeFadeMillis: Long = MediaVolumeFade.DURATION_MILLIS
+    private var volumeFade: VolumeFade? = null
     // Lazy: plain-JUnit sink tests never duck and must not touch the main looper.
     private val duckHandler by lazy { Handler(Looper.getMainLooper()) }
+
+    private val fadeTicker = object : Runnable {
+        override fun run() {
+            val fade = volumeFade ?: return
+            val now = SystemClock.uptimeMillis()
+            if (fade.finished(now)) {
+                volumeFade = null
+                applyMediaGain(fade.to)
+            } else {
+                applyMediaGain(fade.gainAt(now))
+                duckHandler.postDelayed(this, MediaVolumeFade.STEP_MILLIS)
+            }
+        }
+    }
+
+    private fun cancelVolumeFade() {
+        volumeFade = null
+        duckHandler.removeCallbacks(fadeTicker)
+    }
+
+    /**
+     * Moves the music to [target] over [volumeFadeMillis] instead of in one step. The iPhone's duck is
+     * -14 dB; applying it in a single frame is the hard "click" the driver reported on 2026-11-17, while
+     * the head unit's own ducking eases in and out.
+     */
+    private fun fadeMediaVolumeTo(target: Float) {
+        cancelVolumeFade()
+        val from = mediaVolume
+        if (from == target) return
+        if (volumeFadeMillis <= 0L) {
+            applyMediaGain(target)
+            return
+        }
+        val fade = VolumeFade(
+            from = from,
+            to = target,
+            startedAtMillis = SystemClock.uptimeMillis(),
+            durationMillis = volumeFadeMillis,
+        )
+        volumeFade = fade
+        duckHandler.postDelayed(fadeTicker, MediaVolumeFade.STEP_MILLIS)
+    }
 
     /**
      * duckAudio from the iPhone: lower the MEDIA stream at once and restore it when [unduckMedia]
@@ -216,7 +268,7 @@ internal class AudioFocusCoordinator(
         duckRestore?.let(duckHandler::removeCallbacks)
         duckRestore = null
         val ducked = requestedGain(volume).coerceIn(DUCK_FLOOR, 1f)
-        setMediaVolume(ducked)
+        fadeMediaVolumeTo(ducked)
         // Say duck ran and what it acted on: a silent no-op (no media track) must be visible.
         runCatching {
             report("Audio: duck volume=$ducked requested=$volume requestedMs=$durationMs activeTracks=${active.size}")
@@ -225,7 +277,7 @@ internal class AudioFocusCoordinator(
         val holdMillis = maxOf(durationMs, DUCK_SAFETY_MAX_MILLIS)
         val restore = Runnable {
             duckRestore = null
-            volumeBeforeDuck?.let(::setMediaVolume)
+            volumeBeforeDuck?.let(::fadeMediaVolumeTo)
             volumeBeforeDuck = null
             runCatching { report("Audio: duck released by the ${DUCK_SAFETY_MAX_MILLIS}ms ceiling") }
         }
@@ -246,7 +298,7 @@ internal class AudioFocusCoordinator(
         duckRestore?.let(duckHandler::removeCallbacks)
         duckRestore = null
         val restored = volumeBeforeDuck
-        restored?.let(::setMediaVolume)
+        restored?.let(::fadeMediaVolumeTo)
         volumeBeforeDuck = null
         runCatching { report("Audio: unduck restored=${restored ?: "none"} activeTracks=${active.size}") }
     }
