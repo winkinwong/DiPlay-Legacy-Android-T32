@@ -191,9 +191,28 @@ internal object CarPlayMediaKeys {
     private fun updateLocked(active: Boolean) {
         val context = appContext ?: return
         if (controller == null) return
+        val wasActive = mediaAudioActive
         mediaAudioActive = active
         if (active && focusOwner == null) start(context) else if (active) regainFocusLocked()
+        // Music starting is the moment the head unit re-picks the active media client. Re-assert the
+        // button receiver here, not only at attach: on 4.4 the framework drops a receiver that was
+        // registered while the app was not yet playing, and the wheel keys then never arrive
+        // (2026-11-18 field log: receiver registered, zero MEDIA_BUTTON broadcasts).
+        if (active && !wasActive) reassertLegacyMediaButtonReceiver()
         publishPlaybackStateLocked()
+    }
+
+    /** API 19 only: re-register the button receiver and transport client for the audio service. */
+    private fun reassertLegacyMediaButtonReceiver() {
+        if (Build.VERSION.SDK_INT >= 21) return
+        val audio = audioManager() ?: return
+        legacyButtons?.let { buttons ->
+            runCatching { audio.registerMediaButtonEventReceiver(buttons) }
+        }
+        legacyClient?.let { client ->
+            runCatching { audio.registerRemoteControlClient(client) }
+        }
+        keyLog("media keys re-asserted on playback start buttons=${legacyButtons != null} client=${legacyClient != null}")
     }
 
     private fun start(context: Context) {

@@ -1252,6 +1252,16 @@ class CarPlayHostActivity : ComponentActivity() {
             CarPlayMediaButton.forKeyCode(event.keyCode) != null) {
             appendLog("mediakey activity window saw media key ${KeyEvent.keyCodeToString(event.keyCode)}")
         }
+        // Every other non-touch key is logged once per press too: a wheel key that never reaches the
+        // app and a wheel key that arrives with an unknown keyCode look identical in the report
+        // otherwise (2026-11-18: "media keys active", zero keyCodes, so the chain could not be split).
+        if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0 &&
+            CarPlayMediaButton.forKeyCode(event.keyCode) == null) {
+            appendLog(
+                "mediakey window saw non-media key ${KeyEvent.keyCodeToString(event.keyCode)} " +
+                    "code=${event.keyCode} device=${event.deviceId}",
+            )
+        }
         val physicalKey = Triple(event.deviceId, event.keyCode, event.scanCode)
         val downOrUp = event.action == KeyEvent.ACTION_DOWN || event.action == KeyEvent.ACTION_UP
         if (downOrUp && physicalKey in legacySiriPresses) {
