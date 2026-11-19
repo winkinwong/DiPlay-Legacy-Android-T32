@@ -61,6 +61,17 @@ internal object CarPlayMediaKeys {
     private var session: MediaSession? = null
     private var legacyClient: RemoteControlClient? = null
     private var legacyButtons: PendingIntent? = null
+    /** Last PLAYSTATE published to the 4.4 RemoteControlClient; drives the one-time key log. */
+    private var legacyPlayingPublished: Boolean? = null
+
+    private fun audioManager(): AudioManager? = appContext?.let { context ->
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            context.getSystemService(AudioManager::class.java)
+        } else {
+            @Suppress("DEPRECATION")
+            context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+        }
+    }
     private var focusRequest: Any? = null
     private var legacyFocusListener: AudioManager.OnAudioFocusChangeListener? = null
     private var focusOwner: Any? = null
@@ -308,7 +319,25 @@ internal object CarPlayMediaKeys {
             mediaAudioActive
         }
         if (Build.VERSION.SDK_INT < 21) {
-            legacyClient?.setPlaybackState(if (playing) RemoteControlClient.PLAYSTATE_PLAYING else RemoteControlClient.PLAYSTATE_PAUSED)
+            val client: RemoteControlClient = legacyClient ?: return
+            client.setPlaybackState(if (playing) RemoteControlClient.PLAYSTATE_PLAYING else RemoteControlClient.PLAYSTATE_PAUSED)
+            // Android 4.4 routes the wheel keys to whichever client the audio service considers
+            // active, and that decision reads the registered client AND its transport flags. The
+            // flags were set once at attach, so after a pause/resume cycle the service could drop
+            // the client and the keys went nowhere — 2026-11-18 field log: "media keys logged
+            // active" but not a single keyCode ever reached the app. Re-register on every change.
+            client.setTransportControlFlags(
+                RemoteControlClient.FLAG_KEY_MEDIA_PLAY or
+                    RemoteControlClient.FLAG_KEY_MEDIA_PAUSE or
+                    RemoteControlClient.FLAG_KEY_MEDIA_PLAY_PAUSE or
+                    RemoteControlClient.FLAG_KEY_MEDIA_NEXT or
+                    RemoteControlClient.FLAG_KEY_MEDIA_PREVIOUS,
+            )
+            audioManager()?.registerRemoteControlClient(client)
+            if (legacyPlayingPublished != playing) {
+                legacyPlayingPublished = playing
+                keyLog("media keys legacy state playing=$playing")
+            }
             return
         }
         session?.setPlaybackState(

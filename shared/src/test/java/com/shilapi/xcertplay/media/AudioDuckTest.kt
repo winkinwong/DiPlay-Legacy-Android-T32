@@ -51,11 +51,11 @@ class AudioDuckTest {
         val media = track(); val navigation = track()
         coordinator.acquire(media, AudioChannel.MEDIA, attributes)
         coordinator.acquire(navigation, AudioChannel.NAVIGATION, attributes)
-        coordinator.duckMedia(1_000, 0.25f)
-        assertEquals(listOf(0.25f), volumes(media))
+        coordinator.duckMedia(1_000, 0.5f)
+        assertEquals(listOf(0.5f), volumes(media))
         assertTrue("navigation must not duck", volumes(navigation).isEmpty())
         coordinator.unduckMedia()
-        assertEquals(listOf(0.25f, 1f), volumes(media))
+        assertEquals(listOf(0.5f, 1f), volumes(media))
         assertTrue("navigation must stay untouched", volumes(navigation).isEmpty())
     }
 
@@ -64,10 +64,10 @@ class AudioDuckTest {
         val coordinator = coordinator(enabled = false)
         val media = track()
         coordinator.acquire(media, AudioChannel.MEDIA, attributes)
-        coordinator.duckMedia(1_000, 0.2f)
-        assertEquals("duck must lower the music with audio focus off", listOf(0.2f), volumes(media))
+        coordinator.duckMedia(1_000, 0.4f)
+        assertEquals("duck must lower the music with audio focus off", listOf(0.4f), volumes(media))
         coordinator.unduckMedia()
-        assertEquals(listOf(0.2f, 1f), volumes(media))
+        assertEquals(listOf(0.4f, 1f), volumes(media))
     }
 
     /**
@@ -78,13 +78,13 @@ class AudioDuckTest {
         val coordinator = coordinator()
         val media = track()
         coordinator.acquire(media, AudioChannel.MEDIA, attributes)
-        coordinator.duckMedia(500, 0.3f)
-        assertEquals(listOf(0.3f), volumes(media))
+        coordinator.duckMedia(500, 0.5f)
+        assertEquals(listOf(0.5f), volumes(media))
         shadowOf(Looper.getMainLooper()).idleFor(500, TimeUnit.MILLISECONDS)
-        assertEquals("the requested duration alone must not restore", listOf(0.3f), volumes(media))
+        assertEquals("the requested duration alone must not restore", listOf(0.5f), volumes(media))
         shadowOf(Looper.getMainLooper())
             .idleFor(AudioFocusCoordinator.DUCK_SAFETY_MAX_MILLIS, TimeUnit.MILLISECONDS)
-        assertEquals("the ceiling restores without an unduck", listOf(0.3f, 1f), volumes(media))
+        assertEquals("the ceiling restores without an unduck", listOf(0.5f, 1f), volumes(media))
     }
 
     /** A second duck replaces the pending release and keeps the original restore base. */
@@ -92,14 +92,14 @@ class AudioDuckTest {
         val coordinator = coordinator()
         val media = track()
         coordinator.acquire(media, AudioChannel.MEDIA, attributes)
-        coordinator.duckMedia(2_000, 0.5f)
-        coordinator.duckMedia(300, 0.25f)
-        assertEquals(listOf(0.5f, 0.25f), volumes(media))
+        coordinator.duckMedia(2_000, 0.6f)
+        coordinator.duckMedia(300, 0.45f)
+        assertEquals(listOf(0.6f, 0.45f), volumes(media))
         coordinator.unduckMedia()
-        assertEquals("unduck restores the pre-duck volume", listOf(0.5f, 0.25f, 1f), volumes(media))
+        assertEquals("unduck restores the pre-duck volume", listOf(0.6f, 0.45f, 1f), volumes(media))
         shadowOf(Looper.getMainLooper())
             .idleFor(AudioFocusCoordinator.DUCK_SAFETY_MAX_MILLIS + 1, TimeUnit.MILLISECONDS)
-        assertEquals("the replaced timer must not restore twice", listOf(0.5f, 0.25f, 1f), volumes(media))
+        assertEquals("the replaced timer must not restore twice", listOf(0.6f, 0.45f, 1f), volumes(media))
     }
 
     /**
@@ -147,17 +147,17 @@ class AudioDuckTest {
         val coordinator = coordinator()
         val media = track()
         coordinator.acquire(media, AudioChannel.MEDIA, attributes)
-        coordinator.duckMedia(500, 0.2f)
-        assertEquals(listOf(0.2f), volumes(media))
+        coordinator.duckMedia(500, 0.5f)
+        assertEquals(listOf(0.5f), volumes(media))
         // The announcement keeps speaking well past the requested 500 ms.
         shadowOf(Looper.getMainLooper()).idleFor(3_000, TimeUnit.MILLISECONDS)
         assertEquals(
             "the duck must hold while the announcement is still speaking",
-            listOf(0.2f),
+            listOf(0.5f),
             volumes(media),
         )
         coordinator.unduckMedia()
-        assertEquals("unduck ends the duck", listOf(0.2f, 1f), volumes(media))
+        assertEquals("unduck ends the duck", listOf(0.5f, 1f), volumes(media))
     }
 
     /** A lost unduckAudio must not leave the music ducked forever. */
@@ -165,11 +165,11 @@ class AudioDuckTest {
         val coordinator = coordinator()
         val media = track()
         coordinator.acquire(media, AudioChannel.MEDIA, attributes)
-        coordinator.duckMedia(500, 0.2f)
-        assertEquals(listOf(0.2f), volumes(media))
+        coordinator.duckMedia(500, 0.5f)
+        assertEquals(listOf(0.5f), volumes(media))
         shadowOf(Looper.getMainLooper())
             .idleFor(AudioFocusCoordinator.DUCK_SAFETY_MAX_MILLIS + 1, TimeUnit.MILLISECONDS)
-        assertEquals("the safety ceiling restores the music", listOf(0.2f, 1f), volumes(media))
+        assertEquals("the safety ceiling restores the music", listOf(0.5f, 1f), volumes(media))
     }
 
     /**
@@ -183,7 +183,7 @@ class AudioDuckTest {
         coordinator.acquire(media, AudioChannel.MEDIA, attributes)
         coordinator.duckMedia(500, -13.9794f)
         val applied = volumes(media).single()
-        assertEquals("−13.98 dB is about 20% linear gain", 0.2f, applied, 0.02f)
+        assertEquals("−13.98 dB converts to 20% linear, then the floor lifts it", 0.4f, applied, 0.02f)
     }
 
     /**
@@ -202,7 +202,7 @@ class AudioDuckTest {
             .idleFor(MediaVolumeFade.DURATION_MILLIS + 100, TimeUnit.MILLISECONDS)
         val applied = volumes(media)
         assertTrue("the duck must be a fade, not one step: $applied", applied.size >= 3)
-        assertEquals("it lands exactly on the request", 0.2f, applied.last(), 0.02f)
+        assertEquals("it lands on the floor, never deeper", 0.4f, applied.last(), 0.02f)
         assertTrue("no intermediate step may already be the target", applied.dropLast(1).all { it > 0.21f })
         assertTrue("the fade starts near full volume", applied.first() > 0.5f)
         applied.zipWithNext { a, b -> assertTrue("must fall monotonically: $applied", b <= a + 1e-4f) }
@@ -212,7 +212,7 @@ class AudioDuckTest {
         val coordinator = fadingCoordinator()
         val media = track()
         coordinator.acquire(media, AudioChannel.MEDIA, attributes)
-        coordinator.duckMedia(500, 0.2f)
+        coordinator.duckMedia(500, 0.5f)
         shadowOf(Looper.getMainLooper())
             .idleFor(MediaVolumeFade.DURATION_MILLIS + 100, TimeUnit.MILLISECONDS)
         VolumeTrackingAudioTrack.volumes[media]?.clear()
@@ -223,7 +223,10 @@ class AudioDuckTest {
         val applied = volumes(media)
         assertTrue("the restore must be a fade too: $applied", applied.size >= 3)
         assertEquals("it returns to the pre-duck level", 1f, applied.last(), 1e-3f)
-        assertTrue("the restore starts from the ducked level", applied.first() < 0.4f)
+        assertTrue(
+            "the restore must climb from the ducked level, not start at full: $applied",
+            applied.first() < 0.75f,
+        )
         applied.zipWithNext { a, b -> assertTrue("must rise monotonically: $applied", b >= a - 1e-4f) }
     }
 

@@ -185,6 +185,7 @@ internal class AudioFocusCoordinator(
     private fun setMediaVolume(volume: Float) {
         if (volumeFade != null) cancelVolumeFade()
         applyMediaGain(volume)
+        settledVolume = volume
     }
 
     private fun applyMediaGain(volume: Float) {
@@ -202,6 +203,13 @@ internal class AudioFocusCoordinator(
 
     private var duckRestore: Runnable? = null
     private var volumeBeforeDuck: Float? = null
+    /**
+     * The last level the renderer settled on, i.e. not a fade in progress. A duck that arrives while
+     * an unduck fade is still running must restore to THIS, never to the half-faded level: the
+     * 2026-11-18 field log showed restore bases of 1.0 → 0.945 → 0.848 → 0.454 → 0.222, so the music
+     * ratcheted quieter with every announcement until it was barely audible.
+     */
+    private var settledVolume = FULL_VOLUME
     /** Test seam: 0 applies duck/unduck at once, as the pre-fade sink did. */
     internal var volumeFadeMillis: Long = MediaVolumeFade.DURATION_MILLIS
     private var volumeFade: VolumeFade? = null
@@ -209,12 +217,20 @@ internal class AudioFocusCoordinator(
     private val duckHandler by lazy { Handler(Looper.getMainLooper()) }
 
     private val fadeTicker = object : Runnable {
+        private var steps = 0
+
         override fun run() {
             val fade = volumeFade ?: return
             val now = SystemClock.uptimeMillis()
-            if (fade.finished(now)) {
+            // Belt and braces: a clock that does not advance (Robolectric's paused looper) would
+            // otherwise repost forever and hang the test suite.
+            val exhausted = ++steps > MediaVolumeFade.STEPS + FADE_OVERRUN_STEPS
+            if (exhausted || fade.finished(now)) {
                 volumeFade = null
+                steps = 0
                 applyMediaGain(fade.to)
+                // Only a completed fade is a level the driver actually settled on.
+                settledVolume = fade.to
             } else {
                 applyMediaGain(fade.gainAt(now))
                 duckHandler.postDelayed(this, MediaVolumeFade.STEP_MILLIS)
@@ -238,6 +254,7 @@ internal class AudioFocusCoordinator(
         if (from == target) return
         if (volumeFadeMillis <= 0L) {
             applyMediaGain(target)
+            settledVolume = target
             return
         }
         val fade = VolumeFade(
@@ -264,7 +281,10 @@ internal class AudioFocusCoordinator(
      * negative value is converted to linear gain before clamping; a 0..1 value is used as is.
      */
     fun duckMedia(durationMs: Long, volume: Float) {
-        if (volumeBeforeDuck == null) volumeBeforeDuck = mediaVolume
+        // Remember the level the driver actually hears, not the level a fade happened to be at:
+        // a fade interrupted by the next duck left restore bases of 0.945 / 0.848 / 0.454 / 0.222,
+        // so the music ratcheted quieter with every announcement (2026-11-18 field log).
+        if (volumeBeforeDuck == null) volumeBeforeDuck = settledVolume
         duckRestore?.let(duckHandler::removeCallbacks)
         duckRestore = null
         val ducked = requestedGain(volume).coerceIn(DUCK_FLOOR, 1f)
@@ -298,7 +318,9 @@ internal class AudioFocusCoordinator(
         duckRestore?.let(duckHandler::removeCallbacks)
         duckRestore = null
         val restored = volumeBeforeDuck
-        restored?.let(::fadeMediaVolumeTo)
+        // Clamp to the floor: a duck whose restore base was captured below the floor (an interrupted
+        // fade) must not leave the music quieter than the duck itself allows.
+        restored?.let { fadeMediaVolumeTo(it.coerceAtLeast(DUCK_FLOOR)) }
         volumeBeforeDuck = null
         runCatching { report("Audio: unduck restored=${restored ?: "none"} activeTracks=${active.size}") }
     }
@@ -312,11 +334,12 @@ internal class AudioFocusCoordinator(
 
     companion object {
         /**
-         * Lowest media gain a duckAudio request may produce. iOS asks for about -14 dB on this
-         * head unit; honouring a deeper request would silence the music under the announcement,
-         * which reads as a stutter rather than a duck. 20% keeps the music audible underneath.
+         * Lowest media gain a duckAudio request may produce. iOS asks for about -14 dB (linear 0.2)
+         * and the old floor honoured it exactly, which the driver reported as "压得太低，非常难听"
+         * (2026-11-18). A head unit's own ducking lands near -8 dB, so the music stays clearly
+         * audible under the announcement without being buried: 0.4 ≈ -8 dB.
          */
-        const val DUCK_FLOOR = 0.2f
+        const val DUCK_FLOOR = 0.4f
 
         /**
          * Upper bound on how long a duck may hold without an unduck. The iPhone's own duration is
@@ -324,6 +347,9 @@ internal class AudioFocusCoordinator(
          * only guards against a lost unduck leaving the music quiet forever.
          */
         const val DUCK_SAFETY_MAX_MILLIS = 30_000L
+
+        /** Extra fade ticks tolerated past the planned step count before forcing the target. */
+        private const val FADE_OVERRUN_STEPS = 10
 
         private const val TAG = "DiPlay-AudioFocus"
         private const val FULL_VOLUME = 1f
@@ -1575,6 +1601,18 @@ private class AudioRenderer(
                 Log.w(TAG, "audio queue full; dropping newest packets to bound latency")
                 report("Audio: queue full audioType=${format.audioType}")
             }
+            // Drop the OLDEST packet instead of the arriving one and take the new one: throwing away
+            // the newest kept the queue stuck at the same latency and produced the chopped playback
+            // the driver reported (2026-11-18: queue pinned at 191 of 192, dropped=31602). Replacing
+            // the head keeps the buffer moving and makes a starved writer resume on fresh audio.
+            val evicted = queue.poll()
+            if (evicted != null) {
+                queue.offer(AudioPacket(rtp, sample))
+                rebufferCount++
+                if (rebufferCount == 1) {
+                    report("Audio: queue stayed full; dropping oldest packets to keep playback moving")
+                }
+            }
         }
     }
 
@@ -2339,6 +2377,8 @@ private class AudioRenderer(
         const val INPUT_TIMEOUT_US = 10_000L
         const val AUDIO_POLL_MILLIS = 10L
         const val BUFFER_TAIL_WAIT_NS = 500_000_000L
+        /** Extra fade ticks tolerated past the planned step count before forcing the target. */
+        const val MAX_FADE_OVERRUN_STEPS = 10
         // Holds a burst after a Wi-Fi gap (~4 s of AAC) instead of dropping it.
         const val MAX_QUEUED_PACKETS = 192
         const val PREBUFFER_WRITE_CHUNK_BYTES = 2 * 1024
