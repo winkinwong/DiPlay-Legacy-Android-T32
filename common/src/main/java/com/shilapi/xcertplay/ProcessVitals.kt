@@ -25,6 +25,9 @@ object ProcessVitals {
 
     private val lock = Any()
     private var heartbeatThread: Thread? = null
+    /** Highest DiPlay-owned thread count seen this process, and how many times it grew. */
+    @Volatile private var peakDiplayThreads = 0
+    @Volatile private var threadGrowthSamples = 0
 
     fun start(context: Context, nowMillis: Long = System.currentTimeMillis()) =
         startIn(File(context.filesDir, "logs"), nowMillis)
@@ -40,6 +43,25 @@ object ProcessVitals {
         )
         writeHeartbeat(heartbeat, nowMillis)
         startHeartbeatThread(heartbeat)
+    }
+
+    /**
+     * Records the DiPlay-owned thread count on the heartbeat tick. A reconnect builds a whole new
+     * controller, so a leak shows up as this count stepping up and never coming back down — which is
+     * the difference between "the head unit feels slow after reconnecting" and a guess
+     * (2026-11-19 report).
+     */
+    private fun sampleThreads(directory: File) {
+        val diplayCount = currentThreads().count { isDiplayThread(it) }
+        if (diplayCount > peakDiplayThreads) {
+            peakDiplayThreads = diplayCount
+            threadGrowthSamples += 1
+            append(directory, "threads diplay=$diplayCount (new peak, sample #$threadGrowthSamples)")
+        }
+    }
+
+    internal fun isDiplayThread(thread: Thread): Boolean = thread.name.let { name ->
+        name.startsWith("carplay") || name.startsWith("diplay") || name.startsWith("xcertplay")
     }
 
     /** Memory pressure evidence; TRIM_MEMORY_RUNNING_CRITICAL before silence is what an LMK kill looks like. */
@@ -64,13 +86,14 @@ object ProcessVitals {
             // controller that does not release its workers shows up here as a count that only grows
             // (2026-11-19 report: the head unit felt sluggish after several reconnects).
             appendLine(threads)
+            appendLine("threads peak=$peakDiplayThreads growthSamples=$threadGrowthSamples")
             append(if (text.isBlank()) "no vitals recorded" else text.trimEnd())
         }
     }
 
     /** Live thread count plus the busiest DiPlay-owned names, for the exported report. */
     internal fun threadSummary(threads: Array<Thread> = currentThreads()): String {
-        val diplay = threads.filter { it.name.startsWith("carplay") || it.name.startsWith("diplay") || it.name.startsWith("xcertplay") }
+        val diplay = threads.filter(::isDiplayThread)
         val names = diplay.groupingBy { it.name }.eachCount()
             .entries.sortedByDescending { it.value }.take(6)
             .joinToString(" ") { "${it.key}=${it.value}" }
@@ -88,10 +111,12 @@ object ProcessVitals {
 
     private fun startHeartbeatThread(heartbeat: File) = synchronized(lock) {
         if (heartbeatThread?.isAlive == true) return
+        val directory = heartbeat.parentFile ?: return
         heartbeatThread = Thread({
             while (true) {
                 runCatching { Thread.sleep(HEARTBEAT_INTERVAL_MS) }
                 writeHeartbeat(heartbeat, System.currentTimeMillis())
+                runCatching { sampleThreads(directory) }
             }
         }, "diplay-heartbeat").apply {
             isDaemon = true
