@@ -152,6 +152,10 @@ internal class AudioFocusCoordinator(
             request = null
             requestedChannel = null
             mediaVolume = FULL_VOLUME
+            // Keep the duck baseline in step: a duck captured after this reset must not restore to
+            // a level from a session that no longer exists.
+            intendedVolume = FULL_VOLUME
+            volumeBeforeDuck = null
             if (Build.VERSION.SDK_INT >= 26) abandoned?.let { manager?.abandonAudioFocusRequest(it as AudioFocusRequest) }
             else manager?.abandonAudioFocus(currentListener)
             return
@@ -185,7 +189,7 @@ internal class AudioFocusCoordinator(
     private fun setMediaVolume(volume: Float) {
         if (volumeFade != null) cancelVolumeFade()
         applyMediaGain(volume)
-        settledVolume = volume
+        intendedVolume = volume
     }
 
     private fun applyMediaGain(volume: Float) {
@@ -204,12 +208,13 @@ internal class AudioFocusCoordinator(
     private var duckRestore: Runnable? = null
     private var volumeBeforeDuck: Float? = null
     /**
-     * The last level the renderer settled on, i.e. not a fade in progress. A duck that arrives while
-     * an unduck fade is still running must restore to THIS, never to the half-faded level: the
-     * 2026-11-18 field log showed restore bases of 1.0 → 0.945 → 0.848 → 0.454 → 0.222, so the music
-     * ratcheted quieter with every announcement until it was barely audible.
+     * The level the renderer is *meant* to be at, i.e. what focus handling last set. Ducking never
+     * writes it, so a duck that interrupts an unfinished unduck still restores to the intended level.
+     * The 2026-11-18 field log showed restore bases walking 1.0 → 0.945 → 0.848 → 0.454 → 0.222
+     * because the base was read from the in-flight fade; the music ratcheted quieter with every
+     * announcement until the driver had to turn the volume right up.
      */
-    private var settledVolume = FULL_VOLUME
+    private var intendedVolume = FULL_VOLUME
     /** Test seam: 0 applies duck/unduck at once, as the pre-fade sink did. */
     internal var volumeFadeMillis: Long = MediaVolumeFade.DURATION_MILLIS
     private var volumeFade: VolumeFade? = null
@@ -229,8 +234,6 @@ internal class AudioFocusCoordinator(
                 volumeFade = null
                 steps = 0
                 applyMediaGain(fade.to)
-                // Only a completed fade is a level the driver actually settled on.
-                settledVolume = fade.to
             } else {
                 applyMediaGain(fade.gainAt(now))
                 duckHandler.postDelayed(this, MediaVolumeFade.STEP_MILLIS)
@@ -254,7 +257,6 @@ internal class AudioFocusCoordinator(
         if (from == target) return
         if (volumeFadeMillis <= 0L) {
             applyMediaGain(target)
-            settledVolume = target
             return
         }
         val fade = VolumeFade(
@@ -284,7 +286,7 @@ internal class AudioFocusCoordinator(
         // Remember the level the driver actually hears, not the level a fade happened to be at:
         // a fade interrupted by the next duck left restore bases of 0.945 / 0.848 / 0.454 / 0.222,
         // so the music ratcheted quieter with every announcement (2026-11-18 field log).
-        if (volumeBeforeDuck == null) volumeBeforeDuck = settledVolume
+        if (volumeBeforeDuck == null) volumeBeforeDuck = intendedVolume
         duckRestore?.let(duckHandler::removeCallbacks)
         duckRestore = null
         val ducked = requestedGain(volume).coerceIn(DUCK_FLOOR, 1f)
@@ -318,9 +320,7 @@ internal class AudioFocusCoordinator(
         duckRestore?.let(duckHandler::removeCallbacks)
         duckRestore = null
         val restored = volumeBeforeDuck
-        // Clamp to the floor: a duck whose restore base was captured below the floor (an interrupted
-        // fade) must not leave the music quieter than the duck itself allows.
-        restored?.let { fadeMediaVolumeTo(it.coerceAtLeast(DUCK_FLOOR)) }
+        restored?.let(::fadeMediaVolumeTo)
         volumeBeforeDuck = null
         runCatching { report("Audio: unduck restored=${restored ?: "none"} activeTracks=${active.size}") }
     }

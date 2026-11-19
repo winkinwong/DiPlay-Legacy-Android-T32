@@ -230,6 +230,37 @@ class AudioDuckTest {
         applied.zipWithNext { a, b -> assertTrue("must rise monotonically: $applied", b >= a - 1e-4f) }
     }
 
+    /**
+     * The 2026-11-18 field log: restore bases walked 1.0 → 0.945 → 0.848 → 0.454 → 0.222, so the
+     * music got quieter with every announcement until the driver had to turn the volume right up.
+     * A duck arriving while the previous unduck fade is still running must not capture the half-faded
+     * level as its restore base.
+     */
+    @Test fun repeatedDucksNeverRatchetTheMusicDown() {
+        val coordinator = fadingCoordinator()
+        val media = track()
+        coordinator.acquire(media, AudioChannel.MEDIA, attributes)
+
+        repeat(6) {
+            coordinator.duckMedia(500, -13.9794f)
+            shadowOf(Looper.getMainLooper())
+                .idleFor(MediaVolumeFade.DURATION_MILLIS + 100, TimeUnit.MILLISECONDS)
+            // Unduck, then interrupt it part-way through its fade with the next announcement.
+            coordinator.unduckMedia()
+            shadowOf(Looper.getMainLooper()).idleFor(40, TimeUnit.MILLISECONDS)
+        }
+        coordinator.unduckMedia()
+        shadowOf(Looper.getMainLooper())
+            .idleFor(MediaVolumeFade.DURATION_MILLIS + 100, TimeUnit.MILLISECONDS)
+
+        assertEquals(
+            "six announcements must not leave the music quieter than one",
+            1f,
+            volumes(media).last(),
+            1e-3f,
+        )
+    }
+
     private fun fadingCoordinator() =
         AudioFocusCoordinator(context, enabled = true, muteMediaOnTransientLoss = true)
             .also(coordinators::add)
