@@ -2138,6 +2138,18 @@ private class AudioRenderer(
         }
     }
 
+    /**
+     * One non-blocking write attempt: >0 bytes accepted, 0 = buffer full (retry later), <0 = error.
+     * WRITE_BLOCKING is deliberately avoided — see the note in [writePcm].
+     */
+    private fun writeNonBlocking(track: AudioTrack, data: ByteArray, offset: Int, length: Int): Int =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            track.write(data, offset, length, AudioTrack.WRITE_NON_BLOCKING)
+        } else {
+            @Suppress("DEPRECATION")
+            track.write(data, offset, length)
+        }
+
     private fun writePcm(data: ByteArray, offset: Int = 0, length: Int = data.size) {
         // The AudioTrack is built on the first PCM write, not at stream start:
         // a stream that never carries PCM (Siri speech recognition on NTDA3)
@@ -2166,10 +2178,22 @@ private class AudioRenderer(
             }
             val writeStarted = System.nanoTime()
             diagnosticStage = "track-write"
-            val count = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                track.write(data, offset + written, writeLength, AudioTrack.WRITE_BLOCKING)
-            } else {
-                track.write(data, offset + written, writeLength)
+            // Never WRITE_BLOCKING on this unit: a paused track keeps a blocking write parked until
+            // the buffer drains, and pause() cannot release it — the 2026-11-18 log shows a single
+            // write blocked for 355402 ms, which is exactly the "chopped" playback the driver heard.
+            // Poll a non-blocking write and back off, so pause/stop/interrupt always win.
+            var count = writeNonBlocking(track, data, offset + written, writeLength)
+            var waitedMs = 0L
+            while (count == 0 && running && waitedMs < WRITE_STALL_GIVE_UP_MILLIS) {
+                if (!playbackStarted) break // prebuffer path re-enters after the start threshold
+                try {
+                    Thread.sleep(WRITE_RETRY_MILLIS)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    break
+                }
+                waitedMs += WRITE_RETRY_MILLIS
+                count = writeNonBlocking(track, data, offset + written, writeLength)
             }
             if (count > 0 && !firstPcmWriteReported) {
                 firstPcmWriteReported = true
@@ -2186,7 +2210,9 @@ private class AudioRenderer(
             }
             if (count == 0) {
                 zeroWritesThisWindow++
-                break
+                // A full buffer is not an error: the next iteration writes the rest once it drains.
+                if (!playbackStarted) break
+                continue
             }
             if (count < writeLength) partialWritesThisWindow++
             written += count
@@ -2379,6 +2405,10 @@ private class AudioRenderer(
         const val BUFFER_TAIL_WAIT_NS = 500_000_000L
         /** Extra fade ticks tolerated past the planned step count before forcing the target. */
         const val MAX_FADE_OVERRUN_STEPS = 10
+        /** How long a non-blocking write may wait for buffer space before the frame is abandoned. */
+        const val WRITE_STALL_GIVE_UP_MILLIS = 200L
+        /** Retry cadence while the AudioTrack buffer is full. */
+        const val WRITE_RETRY_MILLIS = 5L
         // Holds a burst after a Wi-Fi gap (~4 s of AAC) instead of dropping it.
         const val MAX_QUEUED_PACKETS = 192
         const val PREBUFFER_WRITE_CHUNK_BYTES = 2 * 1024
