@@ -2170,7 +2170,10 @@ private class AudioRenderer(
             fadeApplied = true
         }
         var written = 0
-        while (written < length && running) {
+        // Bounded: a track that accepts nothing (paused, wedged, or a device that never drains) must
+        // abandon this PCM frame instead of spinning the outer loop forever on a zero-length write.
+        var stalledRounds = 0
+        while (written < length && running && stalledRounds <= MAX_WRITE_STALL_ROUNDS) {
             val writeLength = if (playbackStarted) {
                 length - written
             } else {
@@ -2210,10 +2213,13 @@ private class AudioRenderer(
             }
             if (count == 0) {
                 zeroWritesThisWindow++
-                // A full buffer is not an error: the next iteration writes the rest once it drains.
+                // A full buffer is not an error: the next round writes the rest once it drains, but
+                // the round counter guarantees we give up instead of spinning.
                 if (!playbackStarted) break
+                stalledRounds++
                 continue
             }
+            stalledRounds = 0
             if (count < writeLength) partialWritesThisWindow++
             written += count
             val framesWritten = count / frameBytes
@@ -2239,6 +2245,23 @@ private class AudioRenderer(
         }
     }
 
+    /**
+     * Drops the AudioTrack so the next PCM write builds a fresh one. Used when play() succeeds
+     * silently but the route is dead (a reconnect right after the phone used the camera or a call).
+     */
+    private fun releaseTrack() {
+        val stale = track
+        track = null
+        playbackStarted = false
+        prebufferBytes = 0
+        underrunsAtPlaybackStart = 0
+        if (stale != null) {
+            runCatching { stale.pause() }
+            runCatching { stale.flush() }
+            runCatching { stale.release() }
+        }
+    }
+
     private fun startPlayback(track: AudioTrack) {
         diagnosticStage = "track-play"
         underrunsAtPlaybackStart = track.compatUnderruns()
@@ -2247,6 +2270,12 @@ private class AudioRenderer(
             playbackStarted = true
         } catch (error: IllegalStateException) {
             Log.w(TAG, "AudioTrack play failed state=${track.state}", error)
+            // A track built while the audio HAL was still re-routing (a reconnect right after the
+            // phone used the camera or a WeChat call) accepts play() but never advances. Throw it
+            // away so the next PCM write builds a fresh one instead of staying silent until some
+            // unrelated event — on this head unit a reverse-camera switch — rebuilds the route.
+            report("Audio: play failed state=${track.state}; rebuilding the track")
+            releaseTrack()
         }
     }
 
@@ -2387,6 +2416,8 @@ private class AudioRenderer(
                 // Best effort.
             }
         }
+        playbackStarted = false
+        prebufferBytes = 0
     }
 
     private fun AudioTrack.compatUnderruns(): Int =
@@ -2409,6 +2440,8 @@ private class AudioRenderer(
         const val WRITE_STALL_GIVE_UP_MILLIS = 200L
         /** Retry cadence while the AudioTrack buffer is full. */
         const val WRITE_RETRY_MILLIS = 5L
+        /** Outer-loop rounds that may make no progress before this PCM frame is abandoned. */
+        const val MAX_WRITE_STALL_ROUNDS = 3
         // Holds a burst after a Wi-Fi gap (~4 s of AAC) instead of dropping it.
         const val MAX_QUEUED_PACKETS = 192
         const val PREBUFFER_WRITE_CHUNK_BYTES = 2 * 1024

@@ -93,11 +93,27 @@ class IpodServiceStopperTest {
         assertEquals("root-force-stop-failed,kill-background-failed", result.summary)
     }
 
-    @Test fun stopWithRetryRepeatsTheStopAfterEachDelay() {
+    @Test fun stopWithRetryStopsAsSoonAsAMechanismSucceeds() {
+        // A successful stop needs no further rounds; retrying only delays the bring-up.
         stopper.stopWithRetry(context = null, stopper.plan(rootAvailable = true), attempts = 3, delayMs = 400)
-        assertEquals(3, shell.commands.size)
-        assertEquals(3, killer.killed.size)
-        assertEquals(listOf(400L, 400L), delays)
+        assertEquals(1, shell.commands.size)
+        assertEquals(1, killer.killed.size)
+        assertTrue(delays.isEmpty())
+    }
+
+    /**
+     * On this head unit `su` is absent and killBackgroundProcesses is denied, so every round fails
+     * identically. Two identical failures are enough to conclude it cannot work here, so the third
+     * round (and its 400 ms) is skipped (2026-11-19 field log: the same
+     * "root-force-stop-failed,kill-background" on all seven reconnects).
+     */
+    @Test fun stopWithRetryGivesUpWhenEveryRoundFailsTheSameWay() {
+        shell.succeed = false
+        killer.succeed = false
+        val result = stopper.stopWithRetry(context = null, stopper.plan(rootAvailable = true), attempts = 3, delayMs = 400)
+        assertFalse("nothing may report success", result.succeeded)
+        assertEquals("two identical failures are conclusive", 2, shell.commands.size)
+        assertEquals("only the first retry waits", listOf(400L), delays)
     }
 
     @Test fun stopWithRetrySingleAttemptNeverSleeps() {

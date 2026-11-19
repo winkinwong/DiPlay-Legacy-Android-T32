@@ -709,6 +709,12 @@ class CarPlayController(
                     }
                     closeBestEffort("USBMUX") { mux?.close() }
                     mux = null
+                    // Stop accepting work BEFORE tearing down transports: detach() posts its own
+                    // cleanup onto this executor, so a shutdown afterwards waits the full timeout for
+                    // a task that can never run. The 2026-11-19 log shows VPN/NCM taking exactly
+                    // 2012 ms on every reconnect — that was this 2 s awaitTermination timeout, paid
+                    // twice per reconnect (once per controller).
+                    executor.shutdownNow()
                     if (config.transport == CarPlayTransport.WIRED) {
                         closeBestEffort("VPN/NCM") { service?.detach() }
                     }
@@ -3280,7 +3286,13 @@ class CarPlayController(
         private const val WIRELESS_HANDOFF_TIMEOUT_MILLIS = 45_000L
         private const val RFCOMM_CONNECT_TIMEOUT_MILLIS = 15_000L
         private const val MAXIMUM_REENUMERATION_ATTEMPTS = 2
-        private const val EXECUTOR_CLOSE_TIMEOUT_MILLIS = 2_000L
+        /**
+     * Upper bound on waiting for the controller executor to stop. Work is cancelled before the
+     * transports are detached, so this should return in a few milliseconds; the bound only stops a
+     * wedged task from delaying the next reconnect by seconds (it used to be 2 s, and every
+     * reconnect paid it).
+     */
+    private const val EXECUTOR_CLOSE_TIMEOUT_MILLIS = 500L
         private const val ADAPTER_ADDRESS_PLACEHOLDER = "02:00:00:00:00:00"
         private val BLUETOOTH_ADDRESS = Regex("^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$")
     }

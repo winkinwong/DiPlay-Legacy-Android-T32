@@ -57,11 +57,34 @@ object ProcessVitals {
             File(directory, VITALS_FILE_NAME).takeIf { it.isFile }?.readText().orEmpty()
         }.getOrDefault("")
         val heartbeatAge = readHeartbeat(File(directory, HEARTBEAT_FILE_NAME))?.let { nowMillis - it }
+        val threads = threadSummary()
         return buildString {
             appendLine(heartbeatAge?.let { "last heartbeat ageMs=$it ago" } ?: "no heartbeat recorded")
+            // Threads are the cheapest leak signal: DiPlay builds a controller per reconnect, and a
+            // controller that does not release its workers shows up here as a count that only grows
+            // (2026-11-19 report: the head unit felt sluggish after several reconnects).
+            appendLine(threads)
             append(if (text.isBlank()) "no vitals recorded" else text.trimEnd())
         }
     }
+
+    /** Live thread count plus the busiest DiPlay-owned names, for the exported report. */
+    internal fun threadSummary(threads: Array<Thread> = currentThreads()): String {
+        val diplay = threads.filter { it.name.startsWith("carplay") || it.name.startsWith("diplay") || it.name.startsWith("xcertplay") }
+        val names = diplay.groupingBy { it.name }.eachCount()
+            .entries.sortedByDescending { it.value }.take(6)
+            .joinToString(" ") { "${it.key}=${it.value}" }
+        return "threads total=${threads.size} diplay=${diplay.size}" + (if (names.isEmpty()) "" else " $names")
+    }
+
+    private fun currentThreads(): Array<Thread> = runCatching {
+        var top = Thread.currentThread().threadGroup
+        while (top?.parent != null) top = top.parent
+        val group = top ?: return emptyArray()
+        val buffer = arrayOfNulls<Thread>(512)
+        val count = group.enumerate(buffer, true)
+        buffer.take(count).filterNotNull().toTypedArray()
+    }.getOrDefault(emptyArray())
 
     private fun startHeartbeatThread(heartbeat: File) = synchronized(lock) {
         if (heartbeatThread?.isAlive == true) return

@@ -109,10 +109,20 @@ internal class IpodServiceStopper(
     ): StopResult {
         require(attempts >= 1) { "at least one attempt is required" }
         val mechanisms = mutableListOf<String>()
-        mechanisms += stopOnce(context, plan).mechanisms
-        repeat(attempts - 1) {
-            sleeper(delayMs)
-            mechanisms += stopOnce(context, plan).mechanisms
+        var previousRound: String? = null
+        repeat(attempts) { round ->
+            val outcome = stopOnce(context, plan)
+            mechanisms += outcome.mechanisms
+            // A mechanism that worked ends the job; another round cannot improve on success.
+            if (outcome.succeeded) return StopResult(mechanisms)
+            // Identical failure twice in a row means the environment cannot do it at all. On this
+            // head unit `su` is absent and killBackgroundProcesses is denied, so three rounds burned
+            // 1.2 s of every reconnect for nothing (2026-11-19 log: the same
+            // "root-force-stop-failed,kill-background" on all seven reconnects).
+            val signature = outcome.summary
+            if (signature == previousRound) return StopResult(mechanisms)
+            previousRound = signature
+            if (round < attempts - 1) sleeper(delayMs)
         }
         return StopResult(mechanisms)
     }
