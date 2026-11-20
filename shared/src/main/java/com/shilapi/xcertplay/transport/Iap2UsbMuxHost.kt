@@ -67,8 +67,13 @@ class Iap2UsbMuxHost private constructor(
         activeConnections.forEach(Iap2UsbMuxTcpConnection::closeFromHost)
         pipe.close()
         if (::readerThread.isInitialized && Thread.currentThread() !== readerThread) {
+            // Interrupt before joining: pipe.close() does not wake a read that is already parked in
+            // the USB bulk transfer, so the reader would only stop after its full read timeout. The
+            // 2026-11-18 log shows USBMUX teardown taking exactly 1100 ms = readTimeoutMillis (1000)
+            // + CLOSE_JOIN_MARGIN (100) on every reconnect.
+            readerThread.interrupt()
             try {
-                readerThread.join(readTimeoutMillis + CLOSE_JOIN_MARGIN_MILLIS)
+                readerThread.join(CLOSE_JOIN_MAX_MILLIS)
             } catch (_: InterruptedException) {
                 Thread.currentThread().interrupt()
             }
@@ -286,7 +291,11 @@ class Iap2UsbMuxHost private constructor(
         private const val MAX_STALE_HANDSHAKE_FRAMES = 32
         private const val CONNECT_TIMEOUT_MILLIS = 5_000L
         private const val WRITE_TIMEOUT_MILLIS = 2_000
-        private const val CLOSE_JOIN_MARGIN_MILLIS = 100L
+        /**
+         * Bound on the reader join after an interrupt. The reader stops as soon as its current USB
+         * read returns; this only caps a wedged bulk transfer so a reconnect is never held hostage.
+         */
+        private const val CLOSE_JOIN_MAX_MILLIS = 400L
 
         /** Performs the USBMUX v2 handshake and starts the framed reader. */
         fun open(
